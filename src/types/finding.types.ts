@@ -13,6 +13,11 @@ export interface Finding {
   remediation: string;
   confidence?: Confidence;
   promptId?: string;
+  /**
+   * Optional attacker's-eye narrative: how this finding would be chained with
+   * others to reach a real objective. Populated by the expert-audit flow.
+   */
+  attackChain?: string;
 }
 
 export const SEVERITY_RANK: Record<Severity, number> = {

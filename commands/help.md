@@ -8,6 +8,13 @@ Print the following help text verbatim to the user, then stop:
 security-mcp — authorized security testing for localhost + staging only
 
 Commands
+  /security-mcp:audit <url> [maxIterations]
+      Autonomous EXPERT audit: you act as a 20-yr offensive-security lead.
+      Maps the full attack surface, probes every applicable goal until
+      coverage is satisfied, and prints the full report INLINE in the thread
+      (attack-surface map + goal-coverage matrix + attack-chain findings +
+      prioritized remediation). Non-destructive; localhost/staging only.
+
   /security-mcp:scan <url> [quick|standard|deep]
       Full scan: validate → crawl → multi-role probe → prompt loop → write report
 

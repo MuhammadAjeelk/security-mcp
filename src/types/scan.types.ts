@@ -60,6 +60,72 @@ export interface ScanEvidence {
    * NOT full bodies). Used by access-control prompts to detect IDOR/BOLA.
    */
   roleProbes?: Record<string, RoleProbeResult[]>;
+  /**
+   * Deterministic attack-surface map derived from the crawl. Computed by
+   * buildAttackSurface() so it is identical run-to-run for the same evidence.
+   * Consumed by the expert-audit flow and rendered into reports.
+   */
+  attackSurface?: AttackSurface;
+}
+
+/**
+ * One endpoint as seen by an attacker, with deterministically-derived flags
+ * that drive which security goals are applicable to it.
+ */
+export interface AttackSurfaceEndpoint {
+  url: string;
+  method: string;
+  /** Has a `?key=value` query string. */
+  hasQueryParams: boolean;
+  /** Path contains a numeric/UUID segment (IDOR/BOLA-shaped). */
+  hasPathId: boolean;
+  /** Any role saw a 401/403, or status varied across roles — looks protected. */
+  authGated: boolean;
+  /** A discovered <form> posts to this endpoint. */
+  hasForm: boolean;
+  /** Form/endpoint accepts file uploads. */
+  isUpload: boolean;
+  /** Path looks administrative/internal (admin, internal, debug, actuator…). */
+  looksAdmin: boolean;
+  /** Prompt-module ids whose checks apply to this endpoint. */
+  applicableGoals: string[];
+}
+
+/** Catalog entry for a security goal (mirrors a prompt module). */
+export interface AttackSurfaceGoal {
+  id: string;
+  title: string;
+  category: string;
+}
+
+/** Deterministic inventory of everything an attacker can touch. */
+export interface AttackSurface {
+  generatedAt: string;
+  totalEndpoints: number;
+  withParams: number;
+  withPathId: number;
+  authGated: number;
+  uploads: number;
+  adminLike: number;
+  forms: number;
+  endpoints: AttackSurfaceEndpoint[];
+  /** Full goal catalog (= the prompt registry) so coverage can be tracked against it. */
+  goalCatalog: AttackSurfaceGoal[];
+}
+
+/**
+ * One row of the goal-coverage matrix, filled in by the calling LLM during an
+ * expert audit and passed back into generate_report.
+ */
+export interface CoverageRow {
+  goalId: string;
+  goalTitle?: string;
+  status: 'clean' | 'vulnerable' | 'partial' | 'not-applicable' | 'not-tested';
+  endpointsTested?: number;
+  endpointsTotal?: number;
+  /** For vulnerable/partial goals, the specific endpoints implicated. */
+  endpoints?: string[];
+  note?: string;
 }
 
 export interface RoleProbeResult {

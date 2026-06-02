@@ -1,6 +1,6 @@
 {
   "name": "security-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Authorized security testing for localhost and allowlisted staging targets. Exposes MCP tools (validate_target, security_scan, run_prompt_loop, generate_report) and slash commands.",
   "author": {
     "name": "MuhammadAjeelk",
@@ -8,5 +8,11 @@
   },
   "homepage": "https://github.com/MuhammadAjeelk/security-mcp",
   "license": "UNLICENSED",
-  "keywords": ["security", "mcp", "testing", "localhost", "staging"]
+  "keywords": [
+    "security",
+    "mcp",
+    "testing",
+    "localhost",
+    "staging"
+  ]
 }

@@ -13,6 +13,17 @@ const FindingSchema = z.object({
   remediation: z.string(),
   confidence: z.enum(['low', 'medium', 'high']).optional(),
   promptId: z.string().optional(),
+  attackChain: z.string().optional(),
+});
+
+const CoverageRowSchema = z.object({
+  goalId: z.string(),
+  goalTitle: z.string().optional(),
+  status: z.enum(['clean', 'vulnerable', 'partial', 'not-applicable', 'not-tested']),
+  endpointsTested: z.number().int().min(0).optional(),
+  endpointsTotal: z.number().int().min(0).optional(),
+  endpoints: z.array(z.string()).optional(),
+  note: z.string().optional(),
 });
 
 export const reportInputSchema = z.object({
@@ -20,6 +31,8 @@ export const reportInputSchema = z.object({
   findings: z.array(FindingSchema),
   evidence: z.record(z.unknown()),
   scope: z.array(z.string()).optional(),
+  coverageMatrix: z.array(CoverageRowSchema).optional(),
+  executiveSummary: z.string().optional(),
 });
 
 export type ReportInputBody = z.infer<typeof reportInputSchema>;
@@ -36,6 +49,18 @@ export const reportToolDefinition = {
       findings: { type: 'array', items: { type: 'object' } },
       evidence: { type: 'object' },
       scope: { type: 'array', items: { type: 'string' } },
+      coverageMatrix: {
+        type: 'array',
+        description:
+          'Optional goal-coverage matrix from an expert audit. One row per security goal: ' +
+          '{ goalId, goalTitle?, status: clean|vulnerable|partial|not-applicable|not-tested, ' +
+          'endpointsTested?, endpointsTotal?, endpoints?, note? }.',
+        items: { type: 'object' },
+      },
+      executiveSummary: {
+        type: 'string',
+        description: 'Optional executive "are we safe now" narrative from an expert audit.',
+      },
     },
     required: ['targetUrl', 'findings', 'evidence'],
   } as const,
@@ -47,6 +72,8 @@ export async function handleGenerateReport(input: ReportInputBody) {
     scope: input.scope ?? [],
     findings: input.findings as Finding[],
     evidence: input.evidence,
+    coverageMatrix: input.coverageMatrix,
+    executiveSummary: input.executiveSummary,
   });
   return {
     ok: true as const,

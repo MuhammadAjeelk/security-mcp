@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { crawlTarget } from '../../core/scanner/crawler.js';
 import { runBrowserChecks } from '../../core/scanner/browser-scanner.js';
+import { buildAttackSurface } from '../../core/scanner/attack-surface.js';
 import { runActiveProbes } from '../../core/scanner/probe-runner.js';
 import { runTemplates } from '../../core/templates/template-runner.js';
 import { loadBundledTemplates } from '../../core/templates/template-loader.js';
@@ -114,6 +115,15 @@ export async function handleSecurityScan(input: SecurityScanInput) {
   const request: ScanRequest = input;
   let evidence = await crawlTarget({ request, audit });
   evidence = await runBrowserChecks(request, evidence, audit);
+
+  // Deterministic attack-surface map — drives the expert-audit coverage flow
+  // and the report's surface/coverage sections.
+  evidence.attackSurface = buildAttackSurface(evidence);
+  audit.event('attack-surface.built', {
+    endpoints: evidence.attackSurface.totalEndpoints,
+    authGated: evidence.attackSurface.authGated,
+    uploads: evidence.attackSurface.uploads,
+  });
 
   const extraFindings: Finding[] = [];
 

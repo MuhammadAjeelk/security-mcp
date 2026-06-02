@@ -37376,6 +37376,1543 @@ async function runBrowserChecks(request4, evidence, audit) {
   return evidence;
 }
 
+// src/core/prompt-engine/helpers.ts
+function isScanEvidence(value) {
+  return typeof value === "object" && value !== null && "pages" in value && "headers" in value && "cookies" in value;
+}
+function asScanEvidence(value) {
+  return isScanEvidence(value) ? value : null;
+}
+function eachHeaders(evidence) {
+  return Object.entries(evidence.headers).map(([url, headers]) => ({ url, headers }));
+}
+function findHeader(headers, name) {
+  return headers[name.toLowerCase()];
+}
+
+// src/core/prompt-engine/prompts/access-control/idor.prompt.ts
+var idorPrompt = {
+  id: "access-control.idor",
+  title: "Insecure Direct Object Reference (IDOR)",
+  category: "access-control",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect endpoints that expose resources by predictable IDs without verifying that the",
+    "authenticated principal owns or may access them.",
+    "",
+    "Evidence required: discovered endpoints with numeric/uuid path or query parameters,",
+    "response status and bodies for each enumerated ID, contrast between two test accounts.",
+    "",
+    "Constraints: only enumerate within allowed localhost/staging targets; never modify or",
+    "delete resources; max 3 ID variants per endpoint to avoid abusive scanning.",
+    "",
+    "Output: structured findings with severity, confidence, evidence excerpt (\u2264500 chars),",
+    "impact, remediation. Never claim certainty without two-account differential evidence."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const suspects = ev.endpoints.filter((e) => /\/(\d+|[0-9a-f-]{8,})(\/|$|\?)/i.test(e.url));
+    if (suspects.length === 0) return [];
+    const sample = suspects.slice(0, 5).map((e) => `${e.method} ${e.url}`);
+    return [
+      {
+        title: "Endpoints expose object IDs in paths \u2014 verify ownership enforcement",
+        severity: "medium",
+        category: "access-control",
+        description: "One or more discovered endpoints accept object identifiers in the URL. Without an authenticated differential test using at least two distinct roles, IDOR cannot be ruled out.",
+        evidence: { suspectEndpoints: sample, totalSuspects: suspects.length },
+        impact: "If ownership is not enforced, attackers can read or modify resources belonging to other tenants/users.",
+        remediation: "Enforce per-request ownership checks server-side. Prefer opaque, unguessable IDs (UUIDv4/ULID). Add automated tests that issue the same request as two different principals and assert 403/404 for the non-owner.",
+        confidence: "low"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/access-control/bola.prompt.ts
+var bolaPrompt = {
+  id: "access-control.bola",
+  title: "Broken Object Level Authorization (BOLA)",
+  category: "access-control",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify that object-level authorization is enforced on each API endpoint that returns,",
+    "mutates or deletes a single object.",
+    "",
+    "Evidence required: at least two test accounts with different ownership scopes, endpoint",
+    "list, response status codes for the foreign principal.",
+    "",
+    "Constraints: only read operations against allowed targets; do NOT issue mutating verbs",
+    "against another tenant's data even on staging.",
+    "",
+    "Output: severity high if foreign principal receives 2xx with data; severity medium if 200 with empty body;",
+    "confidence high only when differential evidence between two accounts is captured."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    if (ctx.testAccounts.length < 2) {
+      return [
+        {
+          title: "BOLA cannot be verified \u2014 fewer than two test accounts provided",
+          severity: "info",
+          category: "access-control",
+          description: "Broken Object Level Authorization can only be proven by issuing the same request as two distinct principals and comparing responses. Supply at least two `testAccounts` with different roles or ownership scopes to enable this check.",
+          evidence: { providedAccounts: ctx.testAccounts.length },
+          impact: "BOLA findings will be missed until multi-account evidence is supplied.",
+          remediation: "Pass two or more test accounts via the security_scan tool input so the loop can perform differential checks.",
+          confidence: "high"
+        }
+      ];
+    }
+    const probes = ev.roleProbes ?? {};
+    const roles = Object.keys(probes);
+    if (roles.length < 2) return [];
+    const byUrl = {};
+    for (const role of roles) {
+      for (const probe of probes[role] ?? []) {
+        if (!byUrl[probe.url]) byUrl[probe.url] = [];
+        byUrl[probe.url].push({ role, status: probe.status });
+      }
+    }
+    const suspect = [];
+    for (const [url, statuses] of Object.entries(byUrl)) {
+      const has2xx = statuses.some((s) => s.status >= 200 && s.status < 300);
+      const has4xx = statuses.some((s) => s.status === 401 || s.status === 403);
+      const allOk = statuses.every((s) => s.status >= 200 && s.status < 300);
+      if (has2xx && has4xx) {
+        suspect.push({ url, statuses });
+      } else if (allOk && statuses.length > 1) {
+        suspect.push({ url, statuses });
+      }
+    }
+    if (suspect.length === 0) return [];
+    return [
+      {
+        title: "Differential role probe surfaced shared 2xx responses \u2014 verify per-object ownership",
+        severity: "high",
+        category: "access-control",
+        description: "Discovered endpoints returned 2xx for more than one role, OR the auth boundary differs inconsistently across roles. Manually inspect to confirm whether resource ownership is enforced.",
+        evidence: { suspect: suspect.slice(0, 10) },
+        impact: "If ownership is not checked, one tenant/user can read another's data.",
+        remediation: "For every object-fetching endpoint, assert principal owns the resource (or has explicit permission) before returning data. Cover with integration tests using two distinct accounts.",
+        confidence: "medium"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/access-control/bfla.prompt.ts
+var bflaPrompt = {
+  id: "access-control.bfla",
+  title: "Broken Function Level Authorization (BFLA)",
+  category: "access-control",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect endpoints/actions intended for higher-privilege roles that are reachable by",
+    "lower-privilege principals.",
+    "",
+    "Evidence required: admin-style URL patterns (/admin, /internal, /manage), role-specific",
+    "actions discovered in pages or scripts, responses to the same endpoint from two roles.",
+    "",
+    "Constraints: never execute destructive admin actions; for write verbs, only inspect",
+    "whether the endpoint is REACHABLE (e.g., 401 vs 200), never submit payloads.",
+    "",
+    "Output: severity high if low-privilege role gets 2xx on admin route; confidence medium",
+    "unless differential evidence is present."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = ctx.evidence;
+    const eps = ev.endpoints ?? [];
+    const adminLike = eps.filter((e) => /\/(admin|internal|manage|root|debug)(\/|$)/i.test(e.url));
+    if (adminLike.length === 0) return [];
+    return [
+      {
+        title: "Admin-style routes discovered \u2014 verify role-based access control",
+        severity: "medium",
+        category: "access-control",
+        description: "Routes matching admin/internal patterns were discovered during crawl. These should return 401/403 for unauthenticated and non-admin principals.",
+        evidence: { adminEndpoints: adminLike.slice(0, 10).map((e) => `${e.method} ${e.url}`) },
+        impact: "If reachable by non-admins, attackers may escalate function-level privileges (BFLA).",
+        remediation: "Centralize authorization (policy or middleware) and assert role on every admin route. Add tests that hit every admin endpoint as a non-admin and assert 403.",
+        confidence: "low"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/access-control/role-escalation.prompt.ts
+var roleEscalationPrompt = {
+  id: "access-control.role-escalation",
+  title: "Role escalation via mass assignment / role parameter tampering",
+  category: "access-control",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Identify endpoints that accept user-provided `role`, `is_admin`, `permissions`,",
+    "`scope` or similar fields and bind them to server-side models without an allowlist.",
+    "",
+    "Evidence required: form fields, JSON request bodies inferred from inline scripts, profile",
+    "update endpoints, registration endpoints.",
+    "",
+    "Constraints: never actually escalate privileges; only inspect whether suspicious fields are",
+    "accepted, never assert against production tenants.",
+    "",
+    "Output: severity critical when a write endpoint binds role-like fields; confidence high",
+    "only when the field is observed to be honored."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = ctx.evidence;
+    const dangerousNames = ["role", "roles", "is_admin", "isAdmin", "permissions", "scope", "admin"];
+    const hits = (ev.forms ?? []).filter(
+      (f) => f.fields.some((field) => dangerousNames.includes(field))
+    );
+    if (hits.length === 0) return [];
+    return [
+      {
+        title: "Forms accept role-like fields \u2014 verify allowlist on server",
+        severity: "high",
+        category: "access-control",
+        description: "One or more discovered forms include privilege-bearing fields (e.g. role, is_admin). These must never be bound directly to server-side user models.",
+        evidence: {
+          forms: hits.map((f) => ({
+            pageUrl: f.pageUrl,
+            method: f.method,
+            action: f.action,
+            fields: f.fields
+          }))
+        },
+        impact: "Attackers may escalate privileges by submitting `role=admin` during signup or profile update.",
+        remediation: "Use strict allowlists when mapping request body \u2192 user model. Never trust client-supplied role. Add an integration test that submits `role=admin` and asserts the server ignores it.",
+        confidence: "medium"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/access-control/privilege-escalation.prompt.ts
+var privilegeEscalationPrompt = {
+  id: "access-control.privilege-escalation",
+  title: "Vertical / horizontal privilege escalation",
+  category: "access-control",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Detect whether a lower-privileged user can reach higher-privileged functionality",
+    "(vertical) or another peer's resources (horizontal).",
+    "",
+    "Evidence required: two test accounts in different roles; protected endpoint list; response",
+    "codes for both accounts on each endpoint.",
+    "",
+    "Constraints: read-only probing; never use the higher-privileged account to mutate data on",
+    "behalf of the lower-privileged one.",
+    "",
+    "Output: severity critical with high confidence ONLY when differential evidence shows the",
+    "lower role receives data/2xx for protected functionality; otherwise low confidence."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/authentication/auth-bypass.prompt.ts
+var authBypassPrompt = {
+  id: "authentication.auth-bypass",
+  title: "Authentication bypass surfaces",
+  category: "auth",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Identify endpoints that appear to require auth but are reachable unauthenticated, and",
+    "detect common bypass vectors (missing middleware, debug overrides, header trust).",
+    "",
+    "Evidence required: protected-looking paths (account, dashboard, billing, admin),",
+    "unauthenticated response codes, presence of header-based auth bypass headers",
+    "(X-Original-URL, X-Rewrite-URL, X-Forwarded-User).",
+    "",
+    "Constraints: only inspect responses; never brute force credentials; never spray tokens.",
+    "",
+    "Output: severity critical only when an authenticated route is observed returning 2xx",
+    "unauthenticated. Otherwise medium with low confidence and a suggested manual follow-up."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const protectedPattern = /\/(account|dashboard|billing|profile|settings|admin)(\/|$)/i;
+    const reachable = ev.pages.filter(
+      (p) => protectedPattern.test(p.finalUrl) && p.status >= 200 && p.status < 300
+    );
+    const out = [];
+    if (reachable.length > 0 && ctx.testAccounts.length === 0) {
+      out.push({
+        title: "Authenticated-looking pages returned 2xx without supplied credentials",
+        severity: "high",
+        category: "auth",
+        description: "Pages matching common authenticated patterns responded with 2xx although no test account was supplied. This may indicate missing auth middleware OR simply a public marketing page.",
+        evidence: { pages: reachable.slice(0, 5).map((p) => ({ url: p.finalUrl, status: p.status })) },
+        impact: "If genuinely authenticated routes are public, anyone may access private data.",
+        remediation: "Verify each route is behind authentication middleware. Add tests that assert 401/302 for unauthenticated requests to protected routes.",
+        confidence: "low"
+      });
+    }
+    for (const { url, headers } of eachHeaders(ev)) {
+      if (findHeader(headers, "x-debug-mode") || findHeader(headers, "x-bypass-auth")) {
+        out.push({
+          title: "Server emits debug/bypass headers",
+          severity: "high",
+          category: "auth",
+          description: `Response from ${url} exposes a debug or auth-bypass header.`,
+          evidence: { url, suspiciousHeaders: headers },
+          impact: "Debug bypass headers, if respected on the server, allow trivial auth bypass.",
+          remediation: "Remove debug/bypass headers from non-local environments.",
+          confidence: "high"
+        });
+      }
+    }
+    return out;
+  }
+};
+
+// src/core/prompt-engine/prompts/authentication/jwt.prompt.ts
+var jwtPrompt = {
+  id: "authentication.jwt",
+  title: "JWT issuance and validation hygiene",
+  category: "auth",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect weak JWT practices: alg=none acceptance, weak HMAC keys, long-lived tokens,",
+    "missing audience/issuer validation, sensitive claims in the payload.",
+    "",
+    "Evidence required: tokens visible in response bodies, Authorization headers, set-cookie,",
+    "`__Secure-` prefixed cookies, login response payloads.",
+    "",
+    "Constraints: do NOT attempt to forge tokens; do NOT submit alg=none tokens at endpoints",
+    "on hosts that are not local; only DECODE captured tokens for inspection.",
+    "",
+    "Output: severity high when alg=none/HS256-with-likely-weak-secret/long-lived tokens are",
+    "observed; confidence high only when a token is captured AND decoded."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const jwtLike = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
+    const out = [];
+    for (const [url, cookies] of Object.entries(ev.cookies)) {
+      for (const c of cookies) {
+        if (jwtLike.test(c)) {
+          const tokenMatch = c.match(jwtLike);
+          const decoded = tokenMatch ? safeDecodeHeader(tokenMatch[0]) : null;
+          if (decoded?.alg === "none") {
+            out.push({
+              title: "JWT with alg=none observed",
+              severity: "critical",
+              category: "auth",
+              description: `A JWT issued at ${url} declares alg=none, which disables signature verification.`,
+              evidence: { url, header: decoded },
+              impact: "Attackers can forge arbitrary tokens (any identity, any role).",
+              remediation: "Reject alg=none server-side. Pin allowed algorithms (e.g., RS256/EdDSA).",
+              confidence: "high"
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+};
+function safeDecodeHeader(token) {
+  try {
+    const [headerB64] = token.split(".");
+    if (!headerB64) return null;
+    const padded = headerB64.replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(padded, "base64").toString("utf8");
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+// src/core/prompt-engine/prompts/authentication/session.prompt.ts
+var sessionPrompt = {
+  id: "authentication.session",
+  title: "Session cookie hygiene",
+  category: "auth",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify session/auth cookies use Secure, HttpOnly and SameSite attributes appropriate",
+    "to the deployment.",
+    "",
+    "Evidence required: Set-Cookie headers from login flows and authenticated pages.",
+    "",
+    "Output: severity scaled by cookie purpose (session > preferences). Confidence high when",
+    "the cookie attributes are directly inspected."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const [url, cookies] of Object.entries(ev.cookies)) {
+      for (const cookie of cookies) {
+        const lower = cookie.toLowerCase();
+        const looksLikeSession = /\b(sid|session|sess|auth|token|jwt)=/.test(lower);
+        if (!looksLikeSession) continue;
+        const issues = [];
+        if (!lower.includes("httponly")) issues.push("missing HttpOnly");
+        if (!lower.includes("secure")) issues.push("missing Secure");
+        if (!lower.includes("samesite")) issues.push("missing SameSite");
+        if (issues.length > 0) {
+          findings.push({
+            title: `Session-like cookie lacks security attributes (${issues.join(", ")})`,
+            severity: "medium",
+            category: "auth",
+            description: "A cookie that appears to carry a session identifier was issued without one or more recommended security attributes.",
+            evidence: { url, cookieSample: cookie.split(";")[0], issues },
+            impact: "Without HttpOnly the cookie is exposed to XSS; without Secure it can be sent over plaintext; without SameSite it is more vulnerable to CSRF.",
+            remediation: "Set HttpOnly, Secure and SameSite=Lax (or Strict) on session cookies. Re-issue after login.",
+            confidence: "high"
+          });
+        }
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/authentication/password-reset.prompt.ts
+var passwordResetPrompt = {
+  id: "authentication.password-reset",
+  title: "Password reset flow safety",
+  category: "auth",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Inspect the password reset flow for token predictability, lack of invalidation after",
+    "use, host header injection, user enumeration via differing error messages.",
+    "",
+    "Evidence required: reset-password URLs discovered during crawl, response bodies that vary",
+    "based on whether the email exists, any reset emails shown in test fixtures.",
+    "",
+    "Constraints: do NOT trigger real password resets at scale; cap to 2 reset requests per scan;",
+    "do NOT brute-force tokens.",
+    "",
+    "Output: severity high when token reuse is observed or host header is reflected; confidence",
+    "medium without dynamic verification."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/authentication/magic-link.prompt.ts
+var magicLinkPrompt = {
+  id: "authentication.magic-link",
+  title: "Magic-link replay and expiry",
+  category: "auth",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify that magic links expire, are single-use, are bound to the requesting user",
+    "agent / IP where appropriate, and do not log in the wrong account on email mismatch.",
+    "",
+    "Evidence required: magic-link redemption endpoints, replay attempt response, token length",
+    "and entropy assessment.",
+    "",
+    "Constraints: no token brute-forcing; max 2 redemption attempts per token.",
+    "",
+    "Output: severity high when a token can be replayed; confidence high only when the second",
+    "redemption was actually attempted and succeeded against a non-production target."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/authentication/oauth.prompt.ts
+var oauthPrompt = {
+  id: "authentication.oauth",
+  title: "OAuth / SSO misconfiguration",
+  category: "auth",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect open redirect via redirect_uri, missing state/PKCE, weak scope validation,",
+    "token leakage via referer.",
+    "",
+    "Evidence required: OAuth start endpoints, callback URLs, presence of `state` parameter,",
+    "presence of `code_challenge` for public clients.",
+    "",
+    "Constraints: never exchange tokens beyond local/staging; never use a real provider in test.",
+    "",
+    "Output: severity high for missing state / weak redirect validation; confidence medium",
+    "unless the flow was directly initiated by the scanner."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/injection/sql-injection.prompt.ts
+var sqlInjectionPrompt = {
+  id: "injection.sql",
+  title: "SQL injection surface review",
+  category: "injection",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Identify endpoints likely vulnerable to SQLi: unparameterized queries, error-based",
+    "leakage in responses, ORDER BY/limit/raw filters.",
+    "",
+    "Evidence required: query-string parameters on discovered endpoints, response bodies that",
+    "echo input, error messages mentioning SQL/database engines.",
+    "",
+    "Constraints: NO destructive payloads. Use only benign markers (e.g. single quote, comment",
+    "sequence) to detect parser errors. Never UNION/DROP. Never enumerate data.",
+    "",
+    "Output: severity high when DB error strings appear with benign markers; confidence medium",
+    "without payload confirmation."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = ctx.evidence;
+    const errorRe = /\b(sql|syntax|mysql|postgres|sqlite|odbc|ora-\d+)\b/i;
+    const matches = (ev.pages ?? []).filter((p) => errorRe.test(p.finalUrl));
+    if (matches.length === 0) return [];
+    return [
+      {
+        title: "URLs referencing SQL-related paths discovered",
+        severity: "low",
+        category: "injection",
+        description: "URLs containing SQL-related keywords were observed; manually verify parameter handling.",
+        evidence: { urls: matches.map((m) => m.finalUrl).slice(0, 5) },
+        impact: "If query parameters reach SQL unsanitized, full database compromise is possible.",
+        remediation: "Use parameterized queries or an ORM. Never interpolate user input into SQL.",
+        confidence: "low"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/injection/nosql-injection.prompt.ts
+var nosqlInjectionPrompt = {
+  id: "injection.nosql",
+  title: "NoSQL injection surface review",
+  category: "injection",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect endpoints whose JSON bodies are forwarded into NoSQL queries (MongoDB,",
+    'CouchDB) without operator-key filtering. Common pattern: `{ email: { $gt: "" } }`',
+    "bypasses login.",
+    "",
+    "Evidence required: login/search endpoints accepting JSON bodies, parameters that look like",
+    "filters (q, filter, where).",
+    "",
+    "Constraints: do NOT submit operator payloads; only flag risky-shaped endpoints for manual",
+    "verification.",
+    "",
+    "Output: severity high when an auth endpoint accepts arbitrary JSON; confidence low without",
+    "manual confirmation."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/injection/command-injection.prompt.ts
+var commandInjectionPrompt = {
+  id: "injection.command",
+  title: "OS command injection surface",
+  category: "injection",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Detect endpoints that shell out (image processors, PDF generators, ping/diagnostic",
+    "utilities, git clone interfaces).",
+    "",
+    "Evidence required: URL paths containing diag/ping/convert/export, file-format parameters,",
+    "response timing differences with benign markers.",
+    "",
+    "Constraints: NO shell metacharacters injected; only inspect routes and parameter shapes.",
+    "",
+    "Output: severity critical with high confidence ONLY on confirmed code execution evidence;",
+    "otherwise flag as manual-review with low confidence."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/injection/xss.prompt.ts
+var xssPrompt = {
+  id: "injection.xss",
+  title: "Cross-Site Scripting (reflected/stored)",
+  category: "injection",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Identify pages that reflect URL parameters without contextual encoding, or accept",
+    "user content that is rendered without sanitization.",
+    "",
+    "Evidence required: pages whose response contains literal query-string values; absence of",
+    "Content-Security-Policy headers; absence of X-XSS-Protection; framework templating in use.",
+    "",
+    "Constraints: NO live payload injection; use only `__SMCP_XSS__` as a benign marker if any.",
+    "",
+    "Output: severity high when reflection observed without encoding; confidence medium without",
+    "browser-driven verification."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const { url, headers } of eachHeaders(ev)) {
+      const csp = findHeader(headers, "content-security-policy");
+      if (!csp) {
+        findings.push({
+          title: "Missing Content-Security-Policy",
+          severity: "medium",
+          category: "injection",
+          description: `No CSP header on ${url}. CSP is the primary defence-in-depth against XSS.`,
+          evidence: { url },
+          impact: "A successful XSS will have full reign of the DOM and outbound network.",
+          remediation: "Add a strict CSP, e.g. `default-src 'self'; object-src 'none'; base-uri 'self'`. Iterate to nonce-based script-src.",
+          confidence: "high"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/injection/ssrf.prompt.ts
+var ssrfPrompt = {
+  id: "injection.ssrf",
+  title: "Server-Side Request Forgery (SSRF)",
+  category: "injection",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Detect endpoints that accept a URL/host parameter and fetch it server-side without",
+    "an allowlist (image proxies, webhook testers, OEmbed lookups).",
+    "",
+    "Evidence required: parameters named `url`, `target`, `callback`, `webhook`, `image_url`,",
+    "`redirect`, `next`.",
+    "",
+    "Constraints: NEVER point a candidate SSRF endpoint at 169.254.169.254 or any cloud",
+    "metadata IP \u2014 the scanner blocks this anyway. Flag suspicious shape only.",
+    "",
+    "Output: severity critical with high confidence ONLY if metadata service was reached;",
+    "otherwise medium, low confidence."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = ctx.evidence;
+    const urlParamRe = /[?&](url|target|callback|webhook|image_url|next|redirect)=/i;
+    const eps = ev.endpoints ?? [];
+    const pages = ev.pages ?? [];
+    const hits = [
+      ...eps.filter((e) => urlParamRe.test(e.url)).map((e) => e.url),
+      ...pages.filter((p) => urlParamRe.test(p.finalUrl)).map((p) => p.finalUrl)
+    ];
+    if (hits.length === 0) return [];
+    return [
+      {
+        title: "Endpoints accept URL-like parameters \u2014 verify SSRF allowlist",
+        severity: "medium",
+        category: "injection",
+        description: "Parameters that commonly drive server-side fetches were discovered. Ensure each is validated against an allowlist of hosts/schemes before any outbound request.",
+        evidence: { urls: hits.slice(0, 10) },
+        impact: "SSRF can pivot to internal services, cloud metadata, or other tenants.",
+        remediation: "Validate URLs strictly. Block link-local/private IPs, only allow https, resolve DNS once and pin. Use an egress proxy with explicit allowlist where possible.",
+        confidence: "low"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/injection/path-traversal.prompt.ts
+var pathTraversalPrompt = {
+  id: "injection.path-traversal",
+  title: "Path traversal in file-serving endpoints",
+  category: "injection",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect endpoints that serve files based on user-supplied paths/IDs without canonical",
+    "path normalization and allowlist.",
+    "",
+    "Evidence required: endpoints with `filename`, `file`, `path`, `template`, `download`",
+    "parameters; response Content-Type when served.",
+    "",
+    "Constraints: do NOT submit `../etc/passwd` style probes; only flag suspicious shapes.",
+    "",
+    "Output: medium severity, low confidence unless dynamic verification is performed manually."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/rate-limit.prompt.ts
+var rateLimitPrompt = {
+  id: "api.rate-limit",
+  title: "Rate limiting and brute-force protection",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify that authentication, password reset, OTP, and other abuse-prone endpoints",
+    "enforce server-side rate limiting and account lockout.",
+    "",
+    "Evidence required: presence of X-RateLimit-* or Retry-After response headers on sensitive",
+    "endpoints, server response to repeated benign requests.",
+    "",
+    "Constraints: cap test requests to 5 per endpoint; never run brute force.",
+    "",
+    "Output: severity high when no rate-limit signal on /login or /reset; confidence medium",
+    "unless multiple requests were actually issued and compared."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const { url, headers } of eachHeaders(ev)) {
+      if (!/\b(login|signin|auth|reset|otp|verify)\b/i.test(url)) continue;
+      const hasLimit = findHeader(headers, "x-ratelimit-limit") || findHeader(headers, "ratelimit-limit") || findHeader(headers, "retry-after");
+      if (!hasLimit) {
+        findings.push({
+          title: "No rate-limit response headers on sensitive endpoint",
+          severity: "medium",
+          category: "api",
+          description: `No RateLimit / Retry-After header observed on ${url}. Absence of headers is not proof of no rate limiting, but warrants verification.`,
+          evidence: { url },
+          impact: "Without rate limiting, credential stuffing and OTP brute force become trivial.",
+          remediation: "Add per-IP and per-account limits on authentication-adjacent endpoints. Emit Retry-After. Add CAPTCHA or progressive delay after N failures.",
+          confidence: "low"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/api-security/mass-assignment.prompt.ts
+var massAssignmentPrompt = {
+  id: "api.mass-assignment",
+  title: "Mass assignment in update endpoints",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect REST/update endpoints that accept the full model representation without an",
+    "explicit field allowlist (`is_admin`, `tenant_id`, `email_verified`).",
+    "",
+    "Evidence required: PUT/PATCH endpoints with JSON body schemas, forms with hidden fields",
+    "that should be server-side.",
+    "",
+    "Constraints: do not submit payloads beyond what was already discovered.",
+    "",
+    "Output: severity high; confidence medium without dynamic verification."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/excessive-data-exposure.prompt.ts
+var excessiveDataExposurePrompt = {
+  id: "api.excessive-data-exposure",
+  title: "Excessive data exposure / PII leakage in responses",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect API responses that include PII, secrets, internal IDs or other sensitive",
+    "fields not needed by the client.",
+    "",
+    "Evidence required: JSON responses returned by discovered endpoints, response shape",
+    "including SSN/credit-card patterns, presence of password hashes, internal flags.",
+    "",
+    "Constraints: redact any captured PII before adding to findings; only keep key names + sample shape.",
+    "",
+    "Output: severity high when password hashes or PII are returned; confidence high when the",
+    "data is in the captured evidence."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/cors.prompt.ts
+var corsPrompt = {
+  id: "api.cors",
+  title: "CORS misconfiguration",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect overly permissive CORS that combines `Access-Control-Allow-Origin: *` (or",
+    "reflected origin) with `Access-Control-Allow-Credentials: true`, or that whitelists null",
+    "origin.",
+    "",
+    "Evidence required: preflight and main responses with ACAO/ACAC headers.",
+    "",
+    "Output: severity high when credentials + wildcard; high when null origin allowed;",
+    "confidence high when headers were directly captured."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const { url, headers } of eachHeaders(ev)) {
+      const acao = findHeader(headers, "access-control-allow-origin");
+      const acac = findHeader(headers, "access-control-allow-credentials");
+      if (!acao) continue;
+      if (acao === "*" && acac && acac.toLowerCase() === "true") {
+        findings.push({
+          title: "CORS allows credentials with wildcard origin",
+          severity: "critical",
+          category: "api",
+          description: `${url} returns ACAO:* with ACAC:true \u2014 browsers will reject, but the intent reveals likely misconfiguration.`,
+          evidence: { url, acao, acac },
+          impact: "When the origin is reflected instead of `*`, attacker sites can read credentialed responses.",
+          remediation: "Never combine credentials with wildcard. Maintain an explicit origin allowlist.",
+          confidence: "high"
+        });
+      } else if (acao === "null") {
+        findings.push({
+          title: "CORS allows null origin",
+          severity: "high",
+          category: "api",
+          description: `${url} permits the special "null" origin \u2014 sandboxed iframes and data: URLs gain access.`,
+          evidence: { url, acao },
+          impact: "Attacker-controlled sandboxed contexts can read responses.",
+          remediation: 'Remove "null" from the allowlist. Validate origin against a known list.',
+          confidence: "high"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/api-security/csrf.prompt.ts
+var csrfPrompt = {
+  id: "api.csrf",
+  title: "Cross-Site Request Forgery (CSRF) protection",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify state-changing endpoints require a CSRF token, double-submit cookie, or rely",
+    "on a SameSite=Strict/Lax session cookie.",
+    "",
+    "Evidence required: discovered forms with method=POST and the presence of a token-shaped",
+    "hidden input; Set-Cookie SameSite attribute on session cookies.",
+    "",
+    "Output: severity high when no token AND no SameSite; confidence medium without dynamic test."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    const tokenLike = /(csrf|xsrf|_token|authenticity)/i;
+    for (const form of ev.forms) {
+      if (form.method.toUpperCase() === "GET") continue;
+      if (!form.fields.some((f) => tokenLike.test(f))) {
+        findings.push({
+          title: "POST form has no CSRF-token-shaped hidden field",
+          severity: "medium",
+          category: "api",
+          description: `Form at ${form.pageUrl} (action=${form.action ?? form.pageUrl}) is POST but does not contain an obvious CSRF token field.`,
+          evidence: { pageUrl: form.pageUrl, action: form.action, fields: form.fields },
+          impact: "Without CSRF protection (or SameSite=Strict), attacker sites can forge state changes on behalf of the user.",
+          remediation: "Add an unpredictable per-session token in a hidden field validated server-side, OR set session cookies to SameSite=Strict/Lax and verify Origin/Referer on state-changing requests.",
+          confidence: "low"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/api-security/open-redirect.prompt.ts
+var openRedirectPrompt = {
+  id: "api.open-redirect",
+  title: "Open redirect parameters",
+  category: "api",
+  severityFocus: "medium",
+  prompt: [
+    "Goal: Detect redirect-driving parameters (`next`, `redirect`, `return_to`, `continue`,",
+    "`url`) that accept arbitrary external hosts.",
+    "",
+    "Evidence required: discovered URLs containing such parameters; for each, validate that the",
+    "server only redirects to allowlisted destinations.",
+    "",
+    "Constraints: do NOT submit a destination outside the allowlist; flag suspicious shape only.",
+    "",
+    "Output: severity medium; high when combined with OAuth callback paths."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/webhook.prompt.ts
+var webhookPrompt = {
+  id: "api.webhook",
+  title: "Webhook receiver signature verification",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: For inbound webhook endpoints (Stripe, GitHub, Twilio), verify HMAC signature",
+    "validation, timestamp tolerance, replay protection.",
+    "",
+    "Evidence required: discovered endpoints under /webhooks/ or /hooks/; presence of",
+    "X-Hub-Signature-256 / Stripe-Signature handling in the response.",
+    "",
+    "Constraints: do NOT POST forged events. Only inspect endpoint shape.",
+    "",
+    "Output: severity high if there is no evidence of signature header validation; confidence medium."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/sensitive-data.prompt.ts
+var sensitiveDataPrompt = {
+  id: "api.sensitive-data",
+  title: "Sensitive data exposure in responses",
+  category: "api",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Identify responses that contain secrets, API keys, JWTs in URLs, AWS credentials,",
+    "private keys, or PII in plaintext.",
+    "",
+    "Evidence required: response body fragments matched against well-known secret regexes (AWS,",
+    "GitHub, Stripe, Slack); JWT-shaped strings in query strings; password fields returned by APIs.",
+    "",
+    "Constraints: redact captured values to first/last 4 characters before emitting findings.",
+    "",
+    "Output: severity high when secrets are observed; confidence high when regex matches."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = ctx.evidence;
+    const inUrl = (ev.pages ?? []).filter((p) => /[?&](api_key|token|access_token)=/i.test(p.finalUrl));
+    if (inUrl.length === 0) return [];
+    return [
+      {
+        title: "Tokens or keys appear in URL query strings",
+        severity: "high",
+        category: "api",
+        description: "Tokens/keys in query strings are logged in proxies, CDN access logs and browser history, often outliving the session.",
+        evidence: { urls: inUrl.map((p) => p.finalUrl.replace(/=([^&]+)/g, "=<redacted>")) },
+        impact: "Long-lived secret exposure across infrastructure boundaries.",
+        remediation: "Move secrets/tokens out of query strings into Authorization headers or cookies.",
+        confidence: "high"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/api-security/cache-poisoning.prompt.ts
+var cachePoisoningPrompt = {
+  id: "api.cache-poisoning",
+  title: "Cache poisoning risks",
+  category: "api",
+  severityFocus: "medium",
+  prompt: [
+    "Goal: Identify cacheable responses whose contents depend on uncached request headers",
+    "(X-Forwarded-Host, X-Original-URL) \u2014 leading to poisoning of shared caches.",
+    "",
+    "Evidence required: Cache-Control / CDN-Cache-Control headers, Vary header, presence of",
+    "request-header reflection.",
+    "",
+    "Constraints: do NOT submit poisoning payloads against shared caches; flag suspicious Vary",
+    "configurations only.",
+    "",
+    "Output: severity medium; confidence low without dynamic verification."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/api-security/deserialization.prompt.ts
+var deserializationPrompt = {
+  id: "api.deserialization",
+  title: "Insecure deserialization",
+  category: "api",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Identify endpoints that deserialize untrusted input (Java ObjectInputStream, Ruby",
+    "Marshal, Python pickle, .NET BinaryFormatter).",
+    "",
+    "Evidence required: discovered content-types `application/x-java-serialized-object`,",
+    "`application/x-python-pickle`; cookie values that decode as serialized objects.",
+    "",
+    "Constraints: NEVER submit gadget chains; only flag presence of risky deserialization formats.",
+    "",
+    "Output: severity critical; confidence high only when a vulnerable format is directly observed."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/business-logic/payment-abuse.prompt.ts
+var paymentAbusePrompt = {
+  id: "business-logic.payment-abuse",
+  title: "Payment / checkout flow abuse",
+  category: "payment",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Detect checkout flows that trust client-supplied price, currency, quantity, or",
+    "discount fields, or that allow re-using payment intents across orders.",
+    "",
+    "Evidence required: checkout/order POST bodies inferred from forms or scripts, response",
+    "fields containing `amount`, `price`, `currency`, `payment_intent_id`.",
+    "",
+    "Constraints: NEVER place real test charges except against an explicit Stripe/Adyen test",
+    "mode in localhost/staging; cap to 1 test order per scan; never alter live payment intents.",
+    "",
+    "Output: severity critical when price/currency are client-controlled; confidence high only",
+    "when a test order was placed and a tampered field was honored."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/business-logic/coupon-abuse.prompt.ts
+var couponAbusePrompt = {
+  id: "business-logic.coupon-abuse",
+  title: "Coupon / promo code abuse",
+  category: "payment",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify that coupon stacking, single-use enforcement and per-account limits are",
+    "enforced server-side, not just in the UI.",
+    "",
+    "Evidence required: coupon redemption endpoint, response shape, presence of server-side",
+    "usage counter.",
+    "",
+    "Constraints: at most 2 redemption attempts; never abuse production discount codes.",
+    "",
+    "Output: severity high for client-side-only limits; confidence medium without dynamic test."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/business-logic/workflow-bypass.prompt.ts
+var workflowBypassPrompt = {
+  id: "business-logic.workflow-bypass",
+  title: "Multi-step workflow / state transition bypass",
+  category: "business-logic",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect endpoints that allow skipping required prior steps (KYC -> withdraw, signup",
+    "-> verify-email -> purchase) by calling the final step directly.",
+    "",
+    "Evidence required: enumerated step endpoints, whether the final step rejects when prior",
+    "state is missing.",
+    "",
+    "Constraints: never bypass on production tenants; never withdraw funds; read-only probing.",
+    "",
+    "Output: severity high; confidence high only with dynamic state-skip evidence."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/business-logic/race-condition.prompt.ts
+var raceConditionPrompt = {
+  id: "business-logic.race-condition",
+  title: "TOCTOU / race-condition risks",
+  category: "business-logic",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Identify endpoints performing non-atomic check-then-act sequences (gift card",
+    "redemption, balance deduction, voucher use, friend invites).",
+    "",
+    "Evidence required: endpoint list and HTTP verbs; response shape indicating a balance,",
+    "token, or counter.",
+    "",
+    "Constraints: cap any concurrency tests to 3 parallel requests; only against localhost/",
+    "staging; never against payment endpoints in production.",
+    "",
+    "Output: severity high; confidence high only with reproduced race; otherwise medium."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/files/file-upload.prompt.ts
+var fileUploadPrompt = {
+  id: "files.upload",
+  title: "File upload validation",
+  category: "files",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Verify upload endpoints validate content-type AND magic bytes, enforce size limits,",
+    "strip metadata, store outside the web root, and rename to non-guessable identifiers.",
+    "",
+    "Evidence required: discovered <input type=file> forms, upload endpoint, response Location",
+    "header on success, served Content-Type on retrieval.",
+    "",
+    "Constraints: do NOT upload binaries; document the gaps based on the discovered form only.",
+    "",
+    "Output: severity high; confidence medium without a real upload."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/files/insecure-file-access.prompt.ts
+var insecureFileAccessPrompt = {
+  id: "files.insecure-access",
+  title: "Insecure direct file access",
+  category: "files",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect static file serving over user IDs (e.g. /uploads/<userId>/avatar.png) without",
+    "an authorization check, and missing cache-control on sensitive files.",
+    "",
+    "Evidence required: page links to /uploads, /files, /downloads with predictable shapes;",
+    "response headers on a sample fetch.",
+    "",
+    "Constraints: only fetch already-discovered URLs.",
+    "",
+    "Output: severity high if private documents are world-readable; confidence medium without dynamic check."
+  ].join("\n")
+};
+
+// src/core/prompt-engine/prompts/config/env-leak.prompt.ts
+var SENSITIVE_PATHS = [
+  "/.env",
+  "/.env.local",
+  "/.git/config",
+  "/.git/HEAD",
+  "/config.json",
+  "/composer.lock",
+  "/package.json",
+  "/swagger.json",
+  "/openapi.json"
+];
+var envLeakPrompt = {
+  id: "config.env-leak",
+  title: "Environment / config file leakage",
+  category: "configuration",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Detect publicly accessible config files (.env, .git/config, dotfiles, lockfiles)",
+    "that may leak secrets or dependency information.",
+    "",
+    "Evidence required: GETs against well-known sensitive paths; response status and any",
+    "matched secret-shaped strings (key=value).",
+    "",
+    "Constraints: only fetch the listed paths once each. Redact captured secrets before storing."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const exposed = ev.pages.filter(
+      (p) => SENSITIVE_PATHS.some((sp) => p.finalUrl.endsWith(sp)) && p.status >= 200 && p.status < 300
+    );
+    if (exposed.length === 0) return [];
+    return [
+      {
+        title: "Sensitive config files appear publicly accessible",
+        severity: "critical",
+        category: "configuration",
+        description: "One or more sensitive files were served with a 2xx status. These commonly contain secrets, internal endpoints or build metadata.",
+        evidence: { exposed: exposed.map((p) => ({ url: p.finalUrl, status: p.status })) },
+        impact: "Full system compromise is often possible when .env or .git is exposed.",
+        remediation: "Block these paths at the web server / CDN layer. Move secrets out of repo. Ensure deploys do not copy dotfiles into the public directory.",
+        confidence: "high"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/config/debug-endpoint.prompt.ts
+var DEBUG_PATHS = [
+  "/debug",
+  "/__debug__",
+  "/actuator",
+  "/actuator/env",
+  "/health",
+  "/metrics",
+  "/phpinfo.php",
+  "/server-status"
+];
+var debugEndpointPrompt = {
+  id: "config.debug-endpoint",
+  title: "Exposed debug / introspection endpoints",
+  category: "configuration",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Detect debug/introspection endpoints (Spring actuator, Django debug toolbar, Flask",
+    "debugger, phpinfo) that should not be reachable outside the cluster.",
+    "",
+    'Evidence required: status of well-known paths; response body indicators ("Werkzeug",',
+    '"WhiteLabel", "phpinfo", "Bean").',
+    "",
+    "Constraints: only fetch the listed paths once each."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const exposed = ev.pages.filter(
+      (p) => DEBUG_PATHS.some((d) => p.finalUrl.includes(d)) && p.status >= 200 && p.status < 300
+    );
+    if (exposed.length === 0) return [];
+    return [
+      {
+        title: "Debug or introspection endpoints reachable",
+        severity: "high",
+        category: "configuration",
+        description: "Discovered debug-style endpoints returning 2xx.",
+        evidence: { exposed: exposed.map((p) => ({ url: p.finalUrl, status: p.status })) },
+        impact: "Debug endpoints often leak env vars, beans, route maps, memory usage, or enable arbitrary code execution.",
+        remediation: "Disable in non-local environments. Bind to a private network. Add an auth boundary.",
+        confidence: "high"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/config/security-headers.prompt.ts
+var REQUIRED = [
+  {
+    header: "strict-transport-security",
+    severity: "medium",
+    remediation: "Add HSTS with max-age >= 31536000; includeSubDomains; preload (production only)."
+  },
+  {
+    header: "x-content-type-options",
+    severity: "low",
+    remediation: "Send `X-Content-Type-Options: nosniff`."
+  },
+  {
+    header: "x-frame-options",
+    severity: "medium",
+    remediation: "Send `X-Frame-Options: DENY` or use CSP `frame-ancestors`."
+  },
+  {
+    header: "referrer-policy",
+    severity: "low",
+    remediation: "Send `Referrer-Policy: strict-origin-when-cross-origin` or stricter."
+  },
+  {
+    header: "content-security-policy",
+    severity: "high",
+    remediation: "Define a strict CSP scoped to first-party origins."
+  }
+];
+var securityHeadersPrompt = {
+  id: "config.security-headers",
+  title: "Security response headers",
+  category: "headers",
+  severityFocus: "medium",
+  prompt: [
+    "Goal: Audit response headers for HSTS, X-Content-Type-Options, X-Frame-Options,",
+    "Referrer-Policy and CSP. Report each missing header per response.",
+    "",
+    "Evidence required: response headers from the root page and at least one HTML deeper page.",
+    "",
+    "Output: severity per header; confidence high."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const { url, headers } of eachHeaders(ev)) {
+      const isHtml2 = (findHeader(headers, "content-type") ?? "").includes("html");
+      if (!isHtml2) continue;
+      for (const check2 of REQUIRED) {
+        if (!findHeader(headers, check2.header)) {
+          findings.push({
+            title: `Missing security header: ${check2.header}`,
+            severity: check2.severity,
+            category: "headers",
+            description: `${url} response did not include the ${check2.header} header.`,
+            evidence: { url, missingHeader: check2.header },
+            impact: "Reduced defence in depth against browser-side attacks.",
+            remediation: check2.remediation,
+            confidence: "high"
+          });
+        }
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/config/error-leakage.prompt.ts
+var errorLeakagePrompt = {
+  id: "config.error-leakage",
+  title: "Stack trace and server banner leakage",
+  category: "configuration",
+  severityFocus: "medium",
+  prompt: [
+    "Goal: Detect responses that leak server banners, framework versions, or stack traces.",
+    "",
+    "Evidence required: Server / X-Powered-By headers; 5xx response bodies if any were captured.",
+    "",
+    "Output: severity medium; confidence high when headers were directly captured."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    for (const { url, headers } of eachHeaders(ev)) {
+      const server = findHeader(headers, "server");
+      const powered = findHeader(headers, "x-powered-by");
+      if (server && /\d/.test(server)) {
+        findings.push({
+          title: "Server banner discloses version",
+          severity: "low",
+          category: "configuration",
+          description: `${url} responds with Server: ${server}.`,
+          evidence: { url, server },
+          impact: "Version disclosure aids targeted exploit selection.",
+          remediation: "Strip or generalize the Server header in the reverse proxy / framework config.",
+          confidence: "high"
+        });
+      }
+      if (powered) {
+        findings.push({
+          title: "X-Powered-By header present",
+          severity: "low",
+          category: "configuration",
+          description: `${url} responds with X-Powered-By: ${powered}.`,
+          evidence: { url, xPoweredBy: powered },
+          impact: "Discloses framework / language to attackers.",
+          remediation: "Disable X-Powered-By in framework configuration.",
+          confidence: "high"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompts/infrastructure/dependency-risk.prompt.ts
+var dependencyRiskPrompt = {
+  id: "infrastructure.dependency-risk",
+  title: "Exposed dependency / version metadata",
+  category: "infrastructure",
+  severityFocus: "medium",
+  prompt: [
+    "Goal: Detect public exposure of package.json, composer.json, gemfile.lock or other",
+    "dependency manifests that disclose exact versions.",
+    "",
+    "Evidence required: 2xx responses to common dependency manifest paths.",
+    "",
+    "Output: severity medium; confidence high when directly fetched."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const manifestPaths = ["/package.json", "/composer.json", "/Gemfile.lock", "/yarn.lock"];
+    const exposed = ev.pages.filter(
+      (p) => manifestPaths.some((m) => p.finalUrl.endsWith(m)) && p.status === 200
+    );
+    if (exposed.length === 0) return [];
+    return [
+      {
+        title: "Dependency manifest exposed publicly",
+        severity: "medium",
+        category: "infrastructure",
+        description: "A dependency manifest was served from a public URL. Attackers can map exact versions to known CVEs.",
+        evidence: { urls: exposed.map((p) => p.finalUrl) },
+        impact: "Targeted exploitation of known vulnerable versions.",
+        remediation: "Block these paths at the web server / CDN. Do not deploy them as static assets.",
+        confidence: "high"
+      }
+    ];
+  }
+};
+
+// src/core/prompt-engine/prompts/multi-tenant/tenant-isolation.prompt.ts
+var tenantIsolationPrompt = {
+  id: "multi-tenant.isolation",
+  title: "Multi-tenant data isolation",
+  category: "multi-tenant",
+  severityFocus: "critical",
+  prompt: [
+    "Goal: Verify tenant scoping is enforced server-side (not client-side via tenant_id query).",
+    "Detect responses where data from one tenant could be accessed by another principal.",
+    "",
+    "Evidence required: at least two test accounts in different tenants; identical endpoint",
+    "fetched by each; differential response codes and approximate body sizes.",
+    "",
+    "Constraints: never mutate cross-tenant data; read-only differential test.",
+    "",
+    "Output: severity critical when foreign tenant receives 2xx with data; confidence high only",
+    "when the differential probe was executed."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    if (ctx.testAccounts.length < 2) return [];
+    const probes = ev.roleProbes ?? {};
+    const roles = Object.keys(probes);
+    if (roles.length < 2) return [];
+    const [r1, r2] = [roles[0], roles[1]];
+    const aProbes = probes[r1] ?? [];
+    const bProbes = probes[r2] ?? [];
+    const aMap = new Map(aProbes.map((p) => [p.url, p]));
+    const findings = [];
+    for (const bp of bProbes) {
+      const ap = aMap.get(bp.url);
+      if (!ap) continue;
+      const both2xx = ap.status >= 200 && ap.status < 300 && bp.status >= 200 && bp.status < 300;
+      const sizeDelta = Math.abs(ap.bytes - bp.bytes);
+      if (both2xx && sizeDelta < 64) {
+        findings.push({
+          title: "Identical response sizes across two roles \u2014 verify tenant scoping",
+          severity: "high",
+          category: "multi-tenant",
+          description: `Endpoint ${bp.url} returned 2xx responses of nearly identical size to roles "${r1}" and "${r2}". This is unexpected if tenant scoping is enforced.`,
+          evidence: {
+            url: bp.url,
+            [r1]: { status: ap.status, bytes: ap.bytes },
+            [r2]: { status: bp.status, bytes: bp.bytes }
+          },
+          impact: "Cross-tenant data leakage; one tenant may see another's records.",
+          remediation: "Always scope queries by the authenticated tenant id derived from the session, never from the URL or body. Add an integration test that asserts tenant B receives 404 for tenant A's objects.",
+          confidence: "medium"
+        });
+      }
+    }
+    return findings;
+  }
+};
+
+// src/core/prompt-engine/prompt-registry.ts
+var PROMPT_REGISTRY = Object.freeze([
+  // access-control
+  idorPrompt,
+  bolaPrompt,
+  bflaPrompt,
+  roleEscalationPrompt,
+  privilegeEscalationPrompt,
+  // auth
+  authBypassPrompt,
+  jwtPrompt,
+  sessionPrompt,
+  passwordResetPrompt,
+  magicLinkPrompt,
+  oauthPrompt,
+  // injection
+  sqlInjectionPrompt,
+  nosqlInjectionPrompt,
+  commandInjectionPrompt,
+  xssPrompt,
+  ssrfPrompt,
+  pathTraversalPrompt,
+  // api-security
+  rateLimitPrompt,
+  massAssignmentPrompt,
+  excessiveDataExposurePrompt,
+  corsPrompt,
+  csrfPrompt,
+  openRedirectPrompt,
+  webhookPrompt,
+  sensitiveDataPrompt,
+  cachePoisoningPrompt,
+  deserializationPrompt,
+  // business-logic
+  paymentAbusePrompt,
+  couponAbusePrompt,
+  workflowBypassPrompt,
+  raceConditionPrompt,
+  // files
+  fileUploadPrompt,
+  insecureFileAccessPrompt,
+  // configuration
+  envLeakPrompt,
+  debugEndpointPrompt,
+  securityHeadersPrompt,
+  errorLeakagePrompt,
+  // infrastructure
+  dependencyRiskPrompt,
+  // multi-tenant
+  tenantIsolationPrompt
+]);
+
+// src/core/scanner/attack-surface.ts
+function buildAttackSurface(evidence) {
+  const goalCatalog = PROMPT_REGISTRY.map((p) => ({
+    id: p.id,
+    title: p.title,
+    category: p.category
+  }));
+  const formsByUrl = indexFormsByActionUrl(evidence.forms, evidence.targetUrl);
+  const authGatedUrls = collectAuthGatedUrls(evidence);
+  const endpoints = evidence.endpoints.map((e) => {
+    const hasQueryParams = urlHasQuery(e.url);
+    const hasPathId = pathHasId(e.url);
+    const form = formsByUrl.get(normalizeUrl(e.url));
+    const hasForm = !!form;
+    const isUpload = !!form && formLooksLikeUpload(form);
+    const looksAdmin = pathLooksAdmin(e.url);
+    const authGated = authGatedUrls.has(normalizeUrl(e.url));
+    const flags = { hasQueryParams, hasPathId, authGated, hasForm, isUpload, looksAdmin };
+    return {
+      url: e.url,
+      method: e.method,
+      ...flags,
+      applicableGoals: applicableGoalIds(goalCatalog, flags)
+    };
+  });
+  return {
+    generatedAt: evidence.completedAt || evidence.startedAt,
+    totalEndpoints: endpoints.length,
+    withParams: endpoints.filter((e) => e.hasQueryParams).length,
+    withPathId: endpoints.filter((e) => e.hasPathId).length,
+    authGated: endpoints.filter((e) => e.authGated).length,
+    uploads: endpoints.filter((e) => e.isUpload).length,
+    adminLike: endpoints.filter((e) => e.looksAdmin).length,
+    forms: evidence.forms.length,
+    endpoints,
+    goalCatalog
+  };
+}
+function applicableGoalIds(catalog, flags) {
+  const hasInput = flags.hasQueryParams || flags.hasForm;
+  return catalog.filter((g) => {
+    switch (g.category) {
+      case "injection":
+      case "input-validation":
+        return hasInput;
+      case "access-control":
+      case "authorization":
+      case "multi-tenant":
+        return flags.hasPathId || flags.authGated;
+      case "auth":
+        return flags.authGated || flags.hasForm;
+      case "api":
+        return hasInput || flags.hasPathId;
+      case "business-logic":
+      case "payment":
+        return flags.hasForm || flags.hasQueryParams;
+      case "files":
+        return flags.isUpload || flags.hasPathId;
+      // headers / configuration / infrastructure / reporting apply target-wide
+      default:
+        return true;
+    }
+  }).map((g) => g.id);
+}
+function urlHasQuery(url) {
+  try {
+    return [...new URL(url, "http://placeholder.local").searchParams.keys()].length > 0;
+  } catch {
+    return url.includes("?");
+  }
+}
+function pathHasId(url) {
+  const path = safePath(url);
+  return /\/(\d+|[0-9a-f]{8,}|[0-9a-f-]{16,})(\/|$)/i.test(path);
+}
+function pathLooksAdmin(url) {
+  const path = safePath(url).toLowerCase();
+  return /(\/admin|\/internal|\/debug|\/actuator|\/_|\/management|\/console|\/dashboard)/.test(path);
+}
+function formLooksLikeUpload(form) {
+  if (/multipart/i.test(form.method)) return true;
+  return form.fields.some((f) => /(file|upload|attachment|avatar|image|document)/i.test(f));
+}
+function collectAuthGatedUrls(evidence) {
+  const gated = /* @__PURE__ */ new Set();
+  for (const page of evidence.pages) {
+    if (page.status === 401 || page.status === 403) gated.add(normalizeUrl(page.url));
+  }
+  const roleProbes = evidence.roleProbes ?? {};
+  const statusByUrl = /* @__PURE__ */ new Map();
+  for (const results of Object.values(roleProbes)) {
+    for (const r of results) {
+      if (r.status === 401 || r.status === 403) gated.add(normalizeUrl(r.url));
+      const key = normalizeUrl(r.url);
+      const set = statusByUrl.get(key) ?? /* @__PURE__ */ new Set();
+      set.add(r.status);
+      statusByUrl.set(key, set);
+    }
+  }
+  for (const [url, statuses] of statusByUrl) {
+    if (statuses.size > 1) gated.add(url);
+  }
+  return gated;
+}
+function indexFormsByActionUrl(forms, targetUrl) {
+  const map = /* @__PURE__ */ new Map();
+  for (const form of forms) {
+    const action = form.action || form.pageUrl;
+    const abs = absolutize(action, form.pageUrl || targetUrl);
+    map.set(normalizeUrl(abs), form);
+  }
+  return map;
+}
+function absolutize(url, base) {
+  try {
+    return new URL(url, base).toString();
+  } catch {
+    return url;
+  }
+}
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url, "http://placeholder.local");
+    return `${u.origin}${u.pathname}`.replace(/\/$/, "");
+  } catch {
+    return (url.split("?")[0] ?? url).replace(/\/$/, "");
+  }
+}
+function safePath(url) {
+  try {
+    return new URL(url, "http://placeholder.local").pathname;
+  } catch {
+    return url;
+  }
+}
+
 // src/core/scanner/probe-runner.ts
 var import_undici2 = __toESM(require_undici(), 1);
 
@@ -37955,11 +39492,11 @@ var require_exception = /* @__PURE__ */ __commonJSMin(((exports, module) => {
     if (!compact && exception.mark.snippet) where += "\n\n" + exception.mark.snippet;
     return message + " " + where;
   }
-  function YAMLException2(reason, mark) {
+  function YAMLException2(reason, mark2) {
     Error.call(this);
     this.name = "YAMLException";
     this.reason = reason;
-    this.mark = mark;
+    this.mark = mark2;
     this.message = formatError2(this, false);
     if (Error.captureStackTrace) Error.captureStackTrace(this, this.constructor);
     else this.stack = (/* @__PURE__ */ new Error()).stack || "";
@@ -37993,9 +39530,9 @@ var require_snippet = /* @__PURE__ */ __commonJSMin(((exports, module) => {
   function padStart(string3, max) {
     return common.repeat(" ", max - string3.length) + string3;
   }
-  function makeSnippet(mark, options) {
+  function makeSnippet(mark2, options) {
     options = Object.create(options || null);
-    if (!mark.buffer) return null;
+    if (!mark2.buffer) return null;
     if (!options.maxLength) options.maxLength = 79;
     if (typeof options.indent !== "number") options.indent = 1;
     if (typeof options.linesBefore !== "number") options.linesBefore = 3;
@@ -38005,27 +39542,27 @@ var require_snippet = /* @__PURE__ */ __commonJSMin(((exports, module) => {
     const lineEnds = [];
     let match;
     let foundLineNo = -1;
-    while (match = re.exec(mark.buffer)) {
+    while (match = re.exec(mark2.buffer)) {
       lineEnds.push(match.index);
       lineStarts.push(match.index + match[0].length);
-      if (mark.position <= match.index && foundLineNo < 0) foundLineNo = lineStarts.length - 2;
+      if (mark2.position <= match.index && foundLineNo < 0) foundLineNo = lineStarts.length - 2;
     }
     if (foundLineNo < 0) foundLineNo = lineStarts.length - 1;
     let result = "";
-    const lineNoLength = Math.min(mark.line + options.linesAfter, lineEnds.length).toString().length;
+    const lineNoLength = Math.min(mark2.line + options.linesAfter, lineEnds.length).toString().length;
     const maxLineLength = options.maxLength - (options.indent + lineNoLength + 3);
     for (let i = 1; i <= options.linesBefore; i++) {
       if (foundLineNo - i < 0) break;
-      const line2 = getLine(mark.buffer, lineStarts[foundLineNo - i], lineEnds[foundLineNo - i], mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo - i]), maxLineLength);
-      result = common.repeat(" ", options.indent) + padStart((mark.line - i + 1).toString(), lineNoLength) + " | " + line2.str + "\n" + result;
+      const line2 = getLine(mark2.buffer, lineStarts[foundLineNo - i], lineEnds[foundLineNo - i], mark2.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo - i]), maxLineLength);
+      result = common.repeat(" ", options.indent) + padStart((mark2.line - i + 1).toString(), lineNoLength) + " | " + line2.str + "\n" + result;
     }
-    const line = getLine(mark.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark.position, maxLineLength);
-    result += common.repeat(" ", options.indent) + padStart((mark.line + 1).toString(), lineNoLength) + " | " + line.str + "\n";
+    const line = getLine(mark2.buffer, lineStarts[foundLineNo], lineEnds[foundLineNo], mark2.position, maxLineLength);
+    result += common.repeat(" ", options.indent) + padStart((mark2.line + 1).toString(), lineNoLength) + " | " + line.str + "\n";
     result += common.repeat("-", options.indent + lineNoLength + 3 + line.pos) + "^\n";
     for (let i = 1; i <= options.linesAfter; i++) {
       if (foundLineNo + i >= lineEnds.length) break;
-      const line2 = getLine(mark.buffer, lineStarts[foundLineNo + i], lineEnds[foundLineNo + i], mark.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo + i]), maxLineLength);
-      result += common.repeat(" ", options.indent) + padStart((mark.line + i + 1).toString(), lineNoLength) + " | " + line2.str + "\n";
+      const line2 = getLine(mark2.buffer, lineStarts[foundLineNo + i], lineEnds[foundLineNo + i], mark2.position - (lineStarts[foundLineNo] - lineStarts[foundLineNo + i]), maxLineLength);
+      result += common.repeat(" ", options.indent) + padStart((mark2.line + i + 1).toString(), lineNoLength) + " | " + line2.str + "\n";
     }
     return result.replace(/\n$/, "");
   }
@@ -38801,15 +40338,15 @@ var require_loader = /* @__PURE__ */ __commonJSMin(((exports, module) => {
     this.anchorMapTransactions = [];
   }
   function generateError(state, message) {
-    const mark = {
+    const mark2 = {
       name: state.filename,
       buffer: state.input.slice(0, -1),
       position: state.position,
       line: state.line,
       column: state.position - state.lineStart
     };
-    mark.snippet = makeSnippet(mark);
-    return new YAMLException2(message, mark);
+    mark2.snippet = makeSnippet(mark2);
+    return new YAMLException2(message, mark2);
   }
   function throwError(state, message) {
     throw generateError(state, message);
@@ -40415,1407 +41952,6 @@ function buildContext(input) {
   };
 }
 
-// src/core/prompt-engine/helpers.ts
-function isScanEvidence(value) {
-  return typeof value === "object" && value !== null && "pages" in value && "headers" in value && "cookies" in value;
-}
-function asScanEvidence(value) {
-  return isScanEvidence(value) ? value : null;
-}
-function eachHeaders(evidence) {
-  return Object.entries(evidence.headers).map(([url, headers]) => ({ url, headers }));
-}
-function findHeader(headers, name) {
-  return headers[name.toLowerCase()];
-}
-
-// src/core/prompt-engine/prompts/access-control/idor.prompt.ts
-var idorPrompt = {
-  id: "access-control.idor",
-  title: "Insecure Direct Object Reference (IDOR)",
-  category: "access-control",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect endpoints that expose resources by predictable IDs without verifying that the",
-    "authenticated principal owns or may access them.",
-    "",
-    "Evidence required: discovered endpoints with numeric/uuid path or query parameters,",
-    "response status and bodies for each enumerated ID, contrast between two test accounts.",
-    "",
-    "Constraints: only enumerate within allowed localhost/staging targets; never modify or",
-    "delete resources; max 3 ID variants per endpoint to avoid abusive scanning.",
-    "",
-    "Output: structured findings with severity, confidence, evidence excerpt (\u2264500 chars),",
-    "impact, remediation. Never claim certainty without two-account differential evidence."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const suspects = ev.endpoints.filter((e) => /\/(\d+|[0-9a-f-]{8,})(\/|$|\?)/i.test(e.url));
-    if (suspects.length === 0) return [];
-    const sample = suspects.slice(0, 5).map((e) => `${e.method} ${e.url}`);
-    return [
-      {
-        title: "Endpoints expose object IDs in paths \u2014 verify ownership enforcement",
-        severity: "medium",
-        category: "access-control",
-        description: "One or more discovered endpoints accept object identifiers in the URL. Without an authenticated differential test using at least two distinct roles, IDOR cannot be ruled out.",
-        evidence: { suspectEndpoints: sample, totalSuspects: suspects.length },
-        impact: "If ownership is not enforced, attackers can read or modify resources belonging to other tenants/users.",
-        remediation: "Enforce per-request ownership checks server-side. Prefer opaque, unguessable IDs (UUIDv4/ULID). Add automated tests that issue the same request as two different principals and assert 403/404 for the non-owner.",
-        confidence: "low"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/access-control/bola.prompt.ts
-var bolaPrompt = {
-  id: "access-control.bola",
-  title: "Broken Object Level Authorization (BOLA)",
-  category: "access-control",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify that object-level authorization is enforced on each API endpoint that returns,",
-    "mutates or deletes a single object.",
-    "",
-    "Evidence required: at least two test accounts with different ownership scopes, endpoint",
-    "list, response status codes for the foreign principal.",
-    "",
-    "Constraints: only read operations against allowed targets; do NOT issue mutating verbs",
-    "against another tenant's data even on staging.",
-    "",
-    "Output: severity high if foreign principal receives 2xx with data; severity medium if 200 with empty body;",
-    "confidence high only when differential evidence between two accounts is captured."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    if (ctx.testAccounts.length < 2) {
-      return [
-        {
-          title: "BOLA cannot be verified \u2014 fewer than two test accounts provided",
-          severity: "info",
-          category: "access-control",
-          description: "Broken Object Level Authorization can only be proven by issuing the same request as two distinct principals and comparing responses. Supply at least two `testAccounts` with different roles or ownership scopes to enable this check.",
-          evidence: { providedAccounts: ctx.testAccounts.length },
-          impact: "BOLA findings will be missed until multi-account evidence is supplied.",
-          remediation: "Pass two or more test accounts via the security_scan tool input so the loop can perform differential checks.",
-          confidence: "high"
-        }
-      ];
-    }
-    const probes = ev.roleProbes ?? {};
-    const roles = Object.keys(probes);
-    if (roles.length < 2) return [];
-    const byUrl = {};
-    for (const role of roles) {
-      for (const probe of probes[role] ?? []) {
-        if (!byUrl[probe.url]) byUrl[probe.url] = [];
-        byUrl[probe.url].push({ role, status: probe.status });
-      }
-    }
-    const suspect = [];
-    for (const [url, statuses] of Object.entries(byUrl)) {
-      const has2xx = statuses.some((s) => s.status >= 200 && s.status < 300);
-      const has4xx = statuses.some((s) => s.status === 401 || s.status === 403);
-      const allOk = statuses.every((s) => s.status >= 200 && s.status < 300);
-      if (has2xx && has4xx) {
-        suspect.push({ url, statuses });
-      } else if (allOk && statuses.length > 1) {
-        suspect.push({ url, statuses });
-      }
-    }
-    if (suspect.length === 0) return [];
-    return [
-      {
-        title: "Differential role probe surfaced shared 2xx responses \u2014 verify per-object ownership",
-        severity: "high",
-        category: "access-control",
-        description: "Discovered endpoints returned 2xx for more than one role, OR the auth boundary differs inconsistently across roles. Manually inspect to confirm whether resource ownership is enforced.",
-        evidence: { suspect: suspect.slice(0, 10) },
-        impact: "If ownership is not checked, one tenant/user can read another's data.",
-        remediation: "For every object-fetching endpoint, assert principal owns the resource (or has explicit permission) before returning data. Cover with integration tests using two distinct accounts.",
-        confidence: "medium"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/access-control/bfla.prompt.ts
-var bflaPrompt = {
-  id: "access-control.bfla",
-  title: "Broken Function Level Authorization (BFLA)",
-  category: "access-control",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect endpoints/actions intended for higher-privilege roles that are reachable by",
-    "lower-privilege principals.",
-    "",
-    "Evidence required: admin-style URL patterns (/admin, /internal, /manage), role-specific",
-    "actions discovered in pages or scripts, responses to the same endpoint from two roles.",
-    "",
-    "Constraints: never execute destructive admin actions; for write verbs, only inspect",
-    "whether the endpoint is REACHABLE (e.g., 401 vs 200), never submit payloads.",
-    "",
-    "Output: severity high if low-privilege role gets 2xx on admin route; confidence medium",
-    "unless differential evidence is present."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = ctx.evidence;
-    const eps = ev.endpoints ?? [];
-    const adminLike = eps.filter((e) => /\/(admin|internal|manage|root|debug)(\/|$)/i.test(e.url));
-    if (adminLike.length === 0) return [];
-    return [
-      {
-        title: "Admin-style routes discovered \u2014 verify role-based access control",
-        severity: "medium",
-        category: "access-control",
-        description: "Routes matching admin/internal patterns were discovered during crawl. These should return 401/403 for unauthenticated and non-admin principals.",
-        evidence: { adminEndpoints: adminLike.slice(0, 10).map((e) => `${e.method} ${e.url}`) },
-        impact: "If reachable by non-admins, attackers may escalate function-level privileges (BFLA).",
-        remediation: "Centralize authorization (policy or middleware) and assert role on every admin route. Add tests that hit every admin endpoint as a non-admin and assert 403.",
-        confidence: "low"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/access-control/role-escalation.prompt.ts
-var roleEscalationPrompt = {
-  id: "access-control.role-escalation",
-  title: "Role escalation via mass assignment / role parameter tampering",
-  category: "access-control",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Identify endpoints that accept user-provided `role`, `is_admin`, `permissions`,",
-    "`scope` or similar fields and bind them to server-side models without an allowlist.",
-    "",
-    "Evidence required: form fields, JSON request bodies inferred from inline scripts, profile",
-    "update endpoints, registration endpoints.",
-    "",
-    "Constraints: never actually escalate privileges; only inspect whether suspicious fields are",
-    "accepted, never assert against production tenants.",
-    "",
-    "Output: severity critical when a write endpoint binds role-like fields; confidence high",
-    "only when the field is observed to be honored."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = ctx.evidence;
-    const dangerousNames = ["role", "roles", "is_admin", "isAdmin", "permissions", "scope", "admin"];
-    const hits = (ev.forms ?? []).filter(
-      (f) => f.fields.some((field) => dangerousNames.includes(field))
-    );
-    if (hits.length === 0) return [];
-    return [
-      {
-        title: "Forms accept role-like fields \u2014 verify allowlist on server",
-        severity: "high",
-        category: "access-control",
-        description: "One or more discovered forms include privilege-bearing fields (e.g. role, is_admin). These must never be bound directly to server-side user models.",
-        evidence: {
-          forms: hits.map((f) => ({
-            pageUrl: f.pageUrl,
-            method: f.method,
-            action: f.action,
-            fields: f.fields
-          }))
-        },
-        impact: "Attackers may escalate privileges by submitting `role=admin` during signup or profile update.",
-        remediation: "Use strict allowlists when mapping request body \u2192 user model. Never trust client-supplied role. Add an integration test that submits `role=admin` and asserts the server ignores it.",
-        confidence: "medium"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/access-control/privilege-escalation.prompt.ts
-var privilegeEscalationPrompt = {
-  id: "access-control.privilege-escalation",
-  title: "Vertical / horizontal privilege escalation",
-  category: "access-control",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Detect whether a lower-privileged user can reach higher-privileged functionality",
-    "(vertical) or another peer's resources (horizontal).",
-    "",
-    "Evidence required: two test accounts in different roles; protected endpoint list; response",
-    "codes for both accounts on each endpoint.",
-    "",
-    "Constraints: read-only probing; never use the higher-privileged account to mutate data on",
-    "behalf of the lower-privileged one.",
-    "",
-    "Output: severity critical with high confidence ONLY when differential evidence shows the",
-    "lower role receives data/2xx for protected functionality; otherwise low confidence."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/authentication/auth-bypass.prompt.ts
-var authBypassPrompt = {
-  id: "authentication.auth-bypass",
-  title: "Authentication bypass surfaces",
-  category: "auth",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Identify endpoints that appear to require auth but are reachable unauthenticated, and",
-    "detect common bypass vectors (missing middleware, debug overrides, header trust).",
-    "",
-    "Evidence required: protected-looking paths (account, dashboard, billing, admin),",
-    "unauthenticated response codes, presence of header-based auth bypass headers",
-    "(X-Original-URL, X-Rewrite-URL, X-Forwarded-User).",
-    "",
-    "Constraints: only inspect responses; never brute force credentials; never spray tokens.",
-    "",
-    "Output: severity critical only when an authenticated route is observed returning 2xx",
-    "unauthenticated. Otherwise medium with low confidence and a suggested manual follow-up."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const protectedPattern = /\/(account|dashboard|billing|profile|settings|admin)(\/|$)/i;
-    const reachable = ev.pages.filter(
-      (p) => protectedPattern.test(p.finalUrl) && p.status >= 200 && p.status < 300
-    );
-    const out = [];
-    if (reachable.length > 0 && ctx.testAccounts.length === 0) {
-      out.push({
-        title: "Authenticated-looking pages returned 2xx without supplied credentials",
-        severity: "high",
-        category: "auth",
-        description: "Pages matching common authenticated patterns responded with 2xx although no test account was supplied. This may indicate missing auth middleware OR simply a public marketing page.",
-        evidence: { pages: reachable.slice(0, 5).map((p) => ({ url: p.finalUrl, status: p.status })) },
-        impact: "If genuinely authenticated routes are public, anyone may access private data.",
-        remediation: "Verify each route is behind authentication middleware. Add tests that assert 401/302 for unauthenticated requests to protected routes.",
-        confidence: "low"
-      });
-    }
-    for (const { url, headers } of eachHeaders(ev)) {
-      if (findHeader(headers, "x-debug-mode") || findHeader(headers, "x-bypass-auth")) {
-        out.push({
-          title: "Server emits debug/bypass headers",
-          severity: "high",
-          category: "auth",
-          description: `Response from ${url} exposes a debug or auth-bypass header.`,
-          evidence: { url, suspiciousHeaders: headers },
-          impact: "Debug bypass headers, if respected on the server, allow trivial auth bypass.",
-          remediation: "Remove debug/bypass headers from non-local environments.",
-          confidence: "high"
-        });
-      }
-    }
-    return out;
-  }
-};
-
-// src/core/prompt-engine/prompts/authentication/jwt.prompt.ts
-var jwtPrompt = {
-  id: "authentication.jwt",
-  title: "JWT issuance and validation hygiene",
-  category: "auth",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect weak JWT practices: alg=none acceptance, weak HMAC keys, long-lived tokens,",
-    "missing audience/issuer validation, sensitive claims in the payload.",
-    "",
-    "Evidence required: tokens visible in response bodies, Authorization headers, set-cookie,",
-    "`__Secure-` prefixed cookies, login response payloads.",
-    "",
-    "Constraints: do NOT attempt to forge tokens; do NOT submit alg=none tokens at endpoints",
-    "on hosts that are not local; only DECODE captured tokens for inspection.",
-    "",
-    "Output: severity high when alg=none/HS256-with-likely-weak-secret/long-lived tokens are",
-    "observed; confidence high only when a token is captured AND decoded."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const jwtLike = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
-    const out = [];
-    for (const [url, cookies] of Object.entries(ev.cookies)) {
-      for (const c of cookies) {
-        if (jwtLike.test(c)) {
-          const tokenMatch = c.match(jwtLike);
-          const decoded = tokenMatch ? safeDecodeHeader(tokenMatch[0]) : null;
-          if (decoded?.alg === "none") {
-            out.push({
-              title: "JWT with alg=none observed",
-              severity: "critical",
-              category: "auth",
-              description: `A JWT issued at ${url} declares alg=none, which disables signature verification.`,
-              evidence: { url, header: decoded },
-              impact: "Attackers can forge arbitrary tokens (any identity, any role).",
-              remediation: "Reject alg=none server-side. Pin allowed algorithms (e.g., RS256/EdDSA).",
-              confidence: "high"
-            });
-          }
-        }
-      }
-    }
-    return out;
-  }
-};
-function safeDecodeHeader(token) {
-  try {
-    const [headerB64] = token.split(".");
-    if (!headerB64) return null;
-    const padded = headerB64.replace(/-/g, "+").replace(/_/g, "/");
-    const json = Buffer.from(padded, "base64").toString("utf8");
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
-}
-
-// src/core/prompt-engine/prompts/authentication/session.prompt.ts
-var sessionPrompt = {
-  id: "authentication.session",
-  title: "Session cookie hygiene",
-  category: "auth",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify session/auth cookies use Secure, HttpOnly and SameSite attributes appropriate",
-    "to the deployment.",
-    "",
-    "Evidence required: Set-Cookie headers from login flows and authenticated pages.",
-    "",
-    "Output: severity scaled by cookie purpose (session > preferences). Confidence high when",
-    "the cookie attributes are directly inspected."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const [url, cookies] of Object.entries(ev.cookies)) {
-      for (const cookie of cookies) {
-        const lower = cookie.toLowerCase();
-        const looksLikeSession = /\b(sid|session|sess|auth|token|jwt)=/.test(lower);
-        if (!looksLikeSession) continue;
-        const issues = [];
-        if (!lower.includes("httponly")) issues.push("missing HttpOnly");
-        if (!lower.includes("secure")) issues.push("missing Secure");
-        if (!lower.includes("samesite")) issues.push("missing SameSite");
-        if (issues.length > 0) {
-          findings.push({
-            title: `Session-like cookie lacks security attributes (${issues.join(", ")})`,
-            severity: "medium",
-            category: "auth",
-            description: "A cookie that appears to carry a session identifier was issued without one or more recommended security attributes.",
-            evidence: { url, cookieSample: cookie.split(";")[0], issues },
-            impact: "Without HttpOnly the cookie is exposed to XSS; without Secure it can be sent over plaintext; without SameSite it is more vulnerable to CSRF.",
-            remediation: "Set HttpOnly, Secure and SameSite=Lax (or Strict) on session cookies. Re-issue after login.",
-            confidence: "high"
-          });
-        }
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/authentication/password-reset.prompt.ts
-var passwordResetPrompt = {
-  id: "authentication.password-reset",
-  title: "Password reset flow safety",
-  category: "auth",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Inspect the password reset flow for token predictability, lack of invalidation after",
-    "use, host header injection, user enumeration via differing error messages.",
-    "",
-    "Evidence required: reset-password URLs discovered during crawl, response bodies that vary",
-    "based on whether the email exists, any reset emails shown in test fixtures.",
-    "",
-    "Constraints: do NOT trigger real password resets at scale; cap to 2 reset requests per scan;",
-    "do NOT brute-force tokens.",
-    "",
-    "Output: severity high when token reuse is observed or host header is reflected; confidence",
-    "medium without dynamic verification."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/authentication/magic-link.prompt.ts
-var magicLinkPrompt = {
-  id: "authentication.magic-link",
-  title: "Magic-link replay and expiry",
-  category: "auth",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify that magic links expire, are single-use, are bound to the requesting user",
-    "agent / IP where appropriate, and do not log in the wrong account on email mismatch.",
-    "",
-    "Evidence required: magic-link redemption endpoints, replay attempt response, token length",
-    "and entropy assessment.",
-    "",
-    "Constraints: no token brute-forcing; max 2 redemption attempts per token.",
-    "",
-    "Output: severity high when a token can be replayed; confidence high only when the second",
-    "redemption was actually attempted and succeeded against a non-production target."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/authentication/oauth.prompt.ts
-var oauthPrompt = {
-  id: "authentication.oauth",
-  title: "OAuth / SSO misconfiguration",
-  category: "auth",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect open redirect via redirect_uri, missing state/PKCE, weak scope validation,",
-    "token leakage via referer.",
-    "",
-    "Evidence required: OAuth start endpoints, callback URLs, presence of `state` parameter,",
-    "presence of `code_challenge` for public clients.",
-    "",
-    "Constraints: never exchange tokens beyond local/staging; never use a real provider in test.",
-    "",
-    "Output: severity high for missing state / weak redirect validation; confidence medium",
-    "unless the flow was directly initiated by the scanner."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/injection/sql-injection.prompt.ts
-var sqlInjectionPrompt = {
-  id: "injection.sql",
-  title: "SQL injection surface review",
-  category: "injection",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Identify endpoints likely vulnerable to SQLi: unparameterized queries, error-based",
-    "leakage in responses, ORDER BY/limit/raw filters.",
-    "",
-    "Evidence required: query-string parameters on discovered endpoints, response bodies that",
-    "echo input, error messages mentioning SQL/database engines.",
-    "",
-    "Constraints: NO destructive payloads. Use only benign markers (e.g. single quote, comment",
-    "sequence) to detect parser errors. Never UNION/DROP. Never enumerate data.",
-    "",
-    "Output: severity high when DB error strings appear with benign markers; confidence medium",
-    "without payload confirmation."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = ctx.evidence;
-    const errorRe = /\b(sql|syntax|mysql|postgres|sqlite|odbc|ora-\d+)\b/i;
-    const matches = (ev.pages ?? []).filter((p) => errorRe.test(p.finalUrl));
-    if (matches.length === 0) return [];
-    return [
-      {
-        title: "URLs referencing SQL-related paths discovered",
-        severity: "low",
-        category: "injection",
-        description: "URLs containing SQL-related keywords were observed; manually verify parameter handling.",
-        evidence: { urls: matches.map((m) => m.finalUrl).slice(0, 5) },
-        impact: "If query parameters reach SQL unsanitized, full database compromise is possible.",
-        remediation: "Use parameterized queries or an ORM. Never interpolate user input into SQL.",
-        confidence: "low"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/injection/nosql-injection.prompt.ts
-var nosqlInjectionPrompt = {
-  id: "injection.nosql",
-  title: "NoSQL injection surface review",
-  category: "injection",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect endpoints whose JSON bodies are forwarded into NoSQL queries (MongoDB,",
-    'CouchDB) without operator-key filtering. Common pattern: `{ email: { $gt: "" } }`',
-    "bypasses login.",
-    "",
-    "Evidence required: login/search endpoints accepting JSON bodies, parameters that look like",
-    "filters (q, filter, where).",
-    "",
-    "Constraints: do NOT submit operator payloads; only flag risky-shaped endpoints for manual",
-    "verification.",
-    "",
-    "Output: severity high when an auth endpoint accepts arbitrary JSON; confidence low without",
-    "manual confirmation."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/injection/command-injection.prompt.ts
-var commandInjectionPrompt = {
-  id: "injection.command",
-  title: "OS command injection surface",
-  category: "injection",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Detect endpoints that shell out (image processors, PDF generators, ping/diagnostic",
-    "utilities, git clone interfaces).",
-    "",
-    "Evidence required: URL paths containing diag/ping/convert/export, file-format parameters,",
-    "response timing differences with benign markers.",
-    "",
-    "Constraints: NO shell metacharacters injected; only inspect routes and parameter shapes.",
-    "",
-    "Output: severity critical with high confidence ONLY on confirmed code execution evidence;",
-    "otherwise flag as manual-review with low confidence."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/injection/xss.prompt.ts
-var xssPrompt = {
-  id: "injection.xss",
-  title: "Cross-Site Scripting (reflected/stored)",
-  category: "injection",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Identify pages that reflect URL parameters without contextual encoding, or accept",
-    "user content that is rendered without sanitization.",
-    "",
-    "Evidence required: pages whose response contains literal query-string values; absence of",
-    "Content-Security-Policy headers; absence of X-XSS-Protection; framework templating in use.",
-    "",
-    "Constraints: NO live payload injection; use only `__SMCP_XSS__` as a benign marker if any.",
-    "",
-    "Output: severity high when reflection observed without encoding; confidence medium without",
-    "browser-driven verification."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const { url, headers } of eachHeaders(ev)) {
-      const csp = findHeader(headers, "content-security-policy");
-      if (!csp) {
-        findings.push({
-          title: "Missing Content-Security-Policy",
-          severity: "medium",
-          category: "injection",
-          description: `No CSP header on ${url}. CSP is the primary defence-in-depth against XSS.`,
-          evidence: { url },
-          impact: "A successful XSS will have full reign of the DOM and outbound network.",
-          remediation: "Add a strict CSP, e.g. `default-src 'self'; object-src 'none'; base-uri 'self'`. Iterate to nonce-based script-src.",
-          confidence: "high"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/injection/ssrf.prompt.ts
-var ssrfPrompt = {
-  id: "injection.ssrf",
-  title: "Server-Side Request Forgery (SSRF)",
-  category: "injection",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Detect endpoints that accept a URL/host parameter and fetch it server-side without",
-    "an allowlist (image proxies, webhook testers, OEmbed lookups).",
-    "",
-    "Evidence required: parameters named `url`, `target`, `callback`, `webhook`, `image_url`,",
-    "`redirect`, `next`.",
-    "",
-    "Constraints: NEVER point a candidate SSRF endpoint at 169.254.169.254 or any cloud",
-    "metadata IP \u2014 the scanner blocks this anyway. Flag suspicious shape only.",
-    "",
-    "Output: severity critical with high confidence ONLY if metadata service was reached;",
-    "otherwise medium, low confidence."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = ctx.evidence;
-    const urlParamRe = /[?&](url|target|callback|webhook|image_url|next|redirect)=/i;
-    const eps = ev.endpoints ?? [];
-    const pages = ev.pages ?? [];
-    const hits = [
-      ...eps.filter((e) => urlParamRe.test(e.url)).map((e) => e.url),
-      ...pages.filter((p) => urlParamRe.test(p.finalUrl)).map((p) => p.finalUrl)
-    ];
-    if (hits.length === 0) return [];
-    return [
-      {
-        title: "Endpoints accept URL-like parameters \u2014 verify SSRF allowlist",
-        severity: "medium",
-        category: "injection",
-        description: "Parameters that commonly drive server-side fetches were discovered. Ensure each is validated against an allowlist of hosts/schemes before any outbound request.",
-        evidence: { urls: hits.slice(0, 10) },
-        impact: "SSRF can pivot to internal services, cloud metadata, or other tenants.",
-        remediation: "Validate URLs strictly. Block link-local/private IPs, only allow https, resolve DNS once and pin. Use an egress proxy with explicit allowlist where possible.",
-        confidence: "low"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/injection/path-traversal.prompt.ts
-var pathTraversalPrompt = {
-  id: "injection.path-traversal",
-  title: "Path traversal in file-serving endpoints",
-  category: "injection",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect endpoints that serve files based on user-supplied paths/IDs without canonical",
-    "path normalization and allowlist.",
-    "",
-    "Evidence required: endpoints with `filename`, `file`, `path`, `template`, `download`",
-    "parameters; response Content-Type when served.",
-    "",
-    "Constraints: do NOT submit `../etc/passwd` style probes; only flag suspicious shapes.",
-    "",
-    "Output: medium severity, low confidence unless dynamic verification is performed manually."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/rate-limit.prompt.ts
-var rateLimitPrompt = {
-  id: "api.rate-limit",
-  title: "Rate limiting and brute-force protection",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify that authentication, password reset, OTP, and other abuse-prone endpoints",
-    "enforce server-side rate limiting and account lockout.",
-    "",
-    "Evidence required: presence of X-RateLimit-* or Retry-After response headers on sensitive",
-    "endpoints, server response to repeated benign requests.",
-    "",
-    "Constraints: cap test requests to 5 per endpoint; never run brute force.",
-    "",
-    "Output: severity high when no rate-limit signal on /login or /reset; confidence medium",
-    "unless multiple requests were actually issued and compared."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const { url, headers } of eachHeaders(ev)) {
-      if (!/\b(login|signin|auth|reset|otp|verify)\b/i.test(url)) continue;
-      const hasLimit = findHeader(headers, "x-ratelimit-limit") || findHeader(headers, "ratelimit-limit") || findHeader(headers, "retry-after");
-      if (!hasLimit) {
-        findings.push({
-          title: "No rate-limit response headers on sensitive endpoint",
-          severity: "medium",
-          category: "api",
-          description: `No RateLimit / Retry-After header observed on ${url}. Absence of headers is not proof of no rate limiting, but warrants verification.`,
-          evidence: { url },
-          impact: "Without rate limiting, credential stuffing and OTP brute force become trivial.",
-          remediation: "Add per-IP and per-account limits on authentication-adjacent endpoints. Emit Retry-After. Add CAPTCHA or progressive delay after N failures.",
-          confidence: "low"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/api-security/mass-assignment.prompt.ts
-var massAssignmentPrompt = {
-  id: "api.mass-assignment",
-  title: "Mass assignment in update endpoints",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect REST/update endpoints that accept the full model representation without an",
-    "explicit field allowlist (`is_admin`, `tenant_id`, `email_verified`).",
-    "",
-    "Evidence required: PUT/PATCH endpoints with JSON body schemas, forms with hidden fields",
-    "that should be server-side.",
-    "",
-    "Constraints: do not submit payloads beyond what was already discovered.",
-    "",
-    "Output: severity high; confidence medium without dynamic verification."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/excessive-data-exposure.prompt.ts
-var excessiveDataExposurePrompt = {
-  id: "api.excessive-data-exposure",
-  title: "Excessive data exposure / PII leakage in responses",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect API responses that include PII, secrets, internal IDs or other sensitive",
-    "fields not needed by the client.",
-    "",
-    "Evidence required: JSON responses returned by discovered endpoints, response shape",
-    "including SSN/credit-card patterns, presence of password hashes, internal flags.",
-    "",
-    "Constraints: redact any captured PII before adding to findings; only keep key names + sample shape.",
-    "",
-    "Output: severity high when password hashes or PII are returned; confidence high when the",
-    "data is in the captured evidence."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/cors.prompt.ts
-var corsPrompt = {
-  id: "api.cors",
-  title: "CORS misconfiguration",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect overly permissive CORS that combines `Access-Control-Allow-Origin: *` (or",
-    "reflected origin) with `Access-Control-Allow-Credentials: true`, or that whitelists null",
-    "origin.",
-    "",
-    "Evidence required: preflight and main responses with ACAO/ACAC headers.",
-    "",
-    "Output: severity high when credentials + wildcard; high when null origin allowed;",
-    "confidence high when headers were directly captured."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const { url, headers } of eachHeaders(ev)) {
-      const acao = findHeader(headers, "access-control-allow-origin");
-      const acac = findHeader(headers, "access-control-allow-credentials");
-      if (!acao) continue;
-      if (acao === "*" && acac && acac.toLowerCase() === "true") {
-        findings.push({
-          title: "CORS allows credentials with wildcard origin",
-          severity: "critical",
-          category: "api",
-          description: `${url} returns ACAO:* with ACAC:true \u2014 browsers will reject, but the intent reveals likely misconfiguration.`,
-          evidence: { url, acao, acac },
-          impact: "When the origin is reflected instead of `*`, attacker sites can read credentialed responses.",
-          remediation: "Never combine credentials with wildcard. Maintain an explicit origin allowlist.",
-          confidence: "high"
-        });
-      } else if (acao === "null") {
-        findings.push({
-          title: "CORS allows null origin",
-          severity: "high",
-          category: "api",
-          description: `${url} permits the special "null" origin \u2014 sandboxed iframes and data: URLs gain access.`,
-          evidence: { url, acao },
-          impact: "Attacker-controlled sandboxed contexts can read responses.",
-          remediation: 'Remove "null" from the allowlist. Validate origin against a known list.',
-          confidence: "high"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/api-security/csrf.prompt.ts
-var csrfPrompt = {
-  id: "api.csrf",
-  title: "Cross-Site Request Forgery (CSRF) protection",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify state-changing endpoints require a CSRF token, double-submit cookie, or rely",
-    "on a SameSite=Strict/Lax session cookie.",
-    "",
-    "Evidence required: discovered forms with method=POST and the presence of a token-shaped",
-    "hidden input; Set-Cookie SameSite attribute on session cookies.",
-    "",
-    "Output: severity high when no token AND no SameSite; confidence medium without dynamic test."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    const tokenLike = /(csrf|xsrf|_token|authenticity)/i;
-    for (const form of ev.forms) {
-      if (form.method.toUpperCase() === "GET") continue;
-      if (!form.fields.some((f) => tokenLike.test(f))) {
-        findings.push({
-          title: "POST form has no CSRF-token-shaped hidden field",
-          severity: "medium",
-          category: "api",
-          description: `Form at ${form.pageUrl} (action=${form.action ?? form.pageUrl}) is POST but does not contain an obvious CSRF token field.`,
-          evidence: { pageUrl: form.pageUrl, action: form.action, fields: form.fields },
-          impact: "Without CSRF protection (or SameSite=Strict), attacker sites can forge state changes on behalf of the user.",
-          remediation: "Add an unpredictable per-session token in a hidden field validated server-side, OR set session cookies to SameSite=Strict/Lax and verify Origin/Referer on state-changing requests.",
-          confidence: "low"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/api-security/open-redirect.prompt.ts
-var openRedirectPrompt = {
-  id: "api.open-redirect",
-  title: "Open redirect parameters",
-  category: "api",
-  severityFocus: "medium",
-  prompt: [
-    "Goal: Detect redirect-driving parameters (`next`, `redirect`, `return_to`, `continue`,",
-    "`url`) that accept arbitrary external hosts.",
-    "",
-    "Evidence required: discovered URLs containing such parameters; for each, validate that the",
-    "server only redirects to allowlisted destinations.",
-    "",
-    "Constraints: do NOT submit a destination outside the allowlist; flag suspicious shape only.",
-    "",
-    "Output: severity medium; high when combined with OAuth callback paths."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/webhook.prompt.ts
-var webhookPrompt = {
-  id: "api.webhook",
-  title: "Webhook receiver signature verification",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: For inbound webhook endpoints (Stripe, GitHub, Twilio), verify HMAC signature",
-    "validation, timestamp tolerance, replay protection.",
-    "",
-    "Evidence required: discovered endpoints under /webhooks/ or /hooks/; presence of",
-    "X-Hub-Signature-256 / Stripe-Signature handling in the response.",
-    "",
-    "Constraints: do NOT POST forged events. Only inspect endpoint shape.",
-    "",
-    "Output: severity high if there is no evidence of signature header validation; confidence medium."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/sensitive-data.prompt.ts
-var sensitiveDataPrompt = {
-  id: "api.sensitive-data",
-  title: "Sensitive data exposure in responses",
-  category: "api",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Identify responses that contain secrets, API keys, JWTs in URLs, AWS credentials,",
-    "private keys, or PII in plaintext.",
-    "",
-    "Evidence required: response body fragments matched against well-known secret regexes (AWS,",
-    "GitHub, Stripe, Slack); JWT-shaped strings in query strings; password fields returned by APIs.",
-    "",
-    "Constraints: redact captured values to first/last 4 characters before emitting findings.",
-    "",
-    "Output: severity high when secrets are observed; confidence high when regex matches."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = ctx.evidence;
-    const inUrl = (ev.pages ?? []).filter((p) => /[?&](api_key|token|access_token)=/i.test(p.finalUrl));
-    if (inUrl.length === 0) return [];
-    return [
-      {
-        title: "Tokens or keys appear in URL query strings",
-        severity: "high",
-        category: "api",
-        description: "Tokens/keys in query strings are logged in proxies, CDN access logs and browser history, often outliving the session.",
-        evidence: { urls: inUrl.map((p) => p.finalUrl.replace(/=([^&]+)/g, "=<redacted>")) },
-        impact: "Long-lived secret exposure across infrastructure boundaries.",
-        remediation: "Move secrets/tokens out of query strings into Authorization headers or cookies.",
-        confidence: "high"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/api-security/cache-poisoning.prompt.ts
-var cachePoisoningPrompt = {
-  id: "api.cache-poisoning",
-  title: "Cache poisoning risks",
-  category: "api",
-  severityFocus: "medium",
-  prompt: [
-    "Goal: Identify cacheable responses whose contents depend on uncached request headers",
-    "(X-Forwarded-Host, X-Original-URL) \u2014 leading to poisoning of shared caches.",
-    "",
-    "Evidence required: Cache-Control / CDN-Cache-Control headers, Vary header, presence of",
-    "request-header reflection.",
-    "",
-    "Constraints: do NOT submit poisoning payloads against shared caches; flag suspicious Vary",
-    "configurations only.",
-    "",
-    "Output: severity medium; confidence low without dynamic verification."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/api-security/deserialization.prompt.ts
-var deserializationPrompt = {
-  id: "api.deserialization",
-  title: "Insecure deserialization",
-  category: "api",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Identify endpoints that deserialize untrusted input (Java ObjectInputStream, Ruby",
-    "Marshal, Python pickle, .NET BinaryFormatter).",
-    "",
-    "Evidence required: discovered content-types `application/x-java-serialized-object`,",
-    "`application/x-python-pickle`; cookie values that decode as serialized objects.",
-    "",
-    "Constraints: NEVER submit gadget chains; only flag presence of risky deserialization formats.",
-    "",
-    "Output: severity critical; confidence high only when a vulnerable format is directly observed."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/business-logic/payment-abuse.prompt.ts
-var paymentAbusePrompt = {
-  id: "business-logic.payment-abuse",
-  title: "Payment / checkout flow abuse",
-  category: "payment",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Detect checkout flows that trust client-supplied price, currency, quantity, or",
-    "discount fields, or that allow re-using payment intents across orders.",
-    "",
-    "Evidence required: checkout/order POST bodies inferred from forms or scripts, response",
-    "fields containing `amount`, `price`, `currency`, `payment_intent_id`.",
-    "",
-    "Constraints: NEVER place real test charges except against an explicit Stripe/Adyen test",
-    "mode in localhost/staging; cap to 1 test order per scan; never alter live payment intents.",
-    "",
-    "Output: severity critical when price/currency are client-controlled; confidence high only",
-    "when a test order was placed and a tampered field was honored."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/business-logic/coupon-abuse.prompt.ts
-var couponAbusePrompt = {
-  id: "business-logic.coupon-abuse",
-  title: "Coupon / promo code abuse",
-  category: "payment",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify that coupon stacking, single-use enforcement and per-account limits are",
-    "enforced server-side, not just in the UI.",
-    "",
-    "Evidence required: coupon redemption endpoint, response shape, presence of server-side",
-    "usage counter.",
-    "",
-    "Constraints: at most 2 redemption attempts; never abuse production discount codes.",
-    "",
-    "Output: severity high for client-side-only limits; confidence medium without dynamic test."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/business-logic/workflow-bypass.prompt.ts
-var workflowBypassPrompt = {
-  id: "business-logic.workflow-bypass",
-  title: "Multi-step workflow / state transition bypass",
-  category: "business-logic",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect endpoints that allow skipping required prior steps (KYC -> withdraw, signup",
-    "-> verify-email -> purchase) by calling the final step directly.",
-    "",
-    "Evidence required: enumerated step endpoints, whether the final step rejects when prior",
-    "state is missing.",
-    "",
-    "Constraints: never bypass on production tenants; never withdraw funds; read-only probing.",
-    "",
-    "Output: severity high; confidence high only with dynamic state-skip evidence."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/business-logic/race-condition.prompt.ts
-var raceConditionPrompt = {
-  id: "business-logic.race-condition",
-  title: "TOCTOU / race-condition risks",
-  category: "business-logic",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Identify endpoints performing non-atomic check-then-act sequences (gift card",
-    "redemption, balance deduction, voucher use, friend invites).",
-    "",
-    "Evidence required: endpoint list and HTTP verbs; response shape indicating a balance,",
-    "token, or counter.",
-    "",
-    "Constraints: cap any concurrency tests to 3 parallel requests; only against localhost/",
-    "staging; never against payment endpoints in production.",
-    "",
-    "Output: severity high; confidence high only with reproduced race; otherwise medium."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/files/file-upload.prompt.ts
-var fileUploadPrompt = {
-  id: "files.upload",
-  title: "File upload validation",
-  category: "files",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Verify upload endpoints validate content-type AND magic bytes, enforce size limits,",
-    "strip metadata, store outside the web root, and rename to non-guessable identifiers.",
-    "",
-    "Evidence required: discovered <input type=file> forms, upload endpoint, response Location",
-    "header on success, served Content-Type on retrieval.",
-    "",
-    "Constraints: do NOT upload binaries; document the gaps based on the discovered form only.",
-    "",
-    "Output: severity high; confidence medium without a real upload."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/files/insecure-file-access.prompt.ts
-var insecureFileAccessPrompt = {
-  id: "files.insecure-access",
-  title: "Insecure direct file access",
-  category: "files",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect static file serving over user IDs (e.g. /uploads/<userId>/avatar.png) without",
-    "an authorization check, and missing cache-control on sensitive files.",
-    "",
-    "Evidence required: page links to /uploads, /files, /downloads with predictable shapes;",
-    "response headers on a sample fetch.",
-    "",
-    "Constraints: only fetch already-discovered URLs.",
-    "",
-    "Output: severity high if private documents are world-readable; confidence medium without dynamic check."
-  ].join("\n")
-};
-
-// src/core/prompt-engine/prompts/config/env-leak.prompt.ts
-var SENSITIVE_PATHS = [
-  "/.env",
-  "/.env.local",
-  "/.git/config",
-  "/.git/HEAD",
-  "/config.json",
-  "/composer.lock",
-  "/package.json",
-  "/swagger.json",
-  "/openapi.json"
-];
-var envLeakPrompt = {
-  id: "config.env-leak",
-  title: "Environment / config file leakage",
-  category: "configuration",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Detect publicly accessible config files (.env, .git/config, dotfiles, lockfiles)",
-    "that may leak secrets or dependency information.",
-    "",
-    "Evidence required: GETs against well-known sensitive paths; response status and any",
-    "matched secret-shaped strings (key=value).",
-    "",
-    "Constraints: only fetch the listed paths once each. Redact captured secrets before storing."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const exposed = ev.pages.filter(
-      (p) => SENSITIVE_PATHS.some((sp) => p.finalUrl.endsWith(sp)) && p.status >= 200 && p.status < 300
-    );
-    if (exposed.length === 0) return [];
-    return [
-      {
-        title: "Sensitive config files appear publicly accessible",
-        severity: "critical",
-        category: "configuration",
-        description: "One or more sensitive files were served with a 2xx status. These commonly contain secrets, internal endpoints or build metadata.",
-        evidence: { exposed: exposed.map((p) => ({ url: p.finalUrl, status: p.status })) },
-        impact: "Full system compromise is often possible when .env or .git is exposed.",
-        remediation: "Block these paths at the web server / CDN layer. Move secrets out of repo. Ensure deploys do not copy dotfiles into the public directory.",
-        confidence: "high"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/config/debug-endpoint.prompt.ts
-var DEBUG_PATHS = [
-  "/debug",
-  "/__debug__",
-  "/actuator",
-  "/actuator/env",
-  "/health",
-  "/metrics",
-  "/phpinfo.php",
-  "/server-status"
-];
-var debugEndpointPrompt = {
-  id: "config.debug-endpoint",
-  title: "Exposed debug / introspection endpoints",
-  category: "configuration",
-  severityFocus: "high",
-  prompt: [
-    "Goal: Detect debug/introspection endpoints (Spring actuator, Django debug toolbar, Flask",
-    "debugger, phpinfo) that should not be reachable outside the cluster.",
-    "",
-    'Evidence required: status of well-known paths; response body indicators ("Werkzeug",',
-    '"WhiteLabel", "phpinfo", "Bean").',
-    "",
-    "Constraints: only fetch the listed paths once each."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const exposed = ev.pages.filter(
-      (p) => DEBUG_PATHS.some((d) => p.finalUrl.includes(d)) && p.status >= 200 && p.status < 300
-    );
-    if (exposed.length === 0) return [];
-    return [
-      {
-        title: "Debug or introspection endpoints reachable",
-        severity: "high",
-        category: "configuration",
-        description: "Discovered debug-style endpoints returning 2xx.",
-        evidence: { exposed: exposed.map((p) => ({ url: p.finalUrl, status: p.status })) },
-        impact: "Debug endpoints often leak env vars, beans, route maps, memory usage, or enable arbitrary code execution.",
-        remediation: "Disable in non-local environments. Bind to a private network. Add an auth boundary.",
-        confidence: "high"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/config/security-headers.prompt.ts
-var REQUIRED = [
-  {
-    header: "strict-transport-security",
-    severity: "medium",
-    remediation: "Add HSTS with max-age >= 31536000; includeSubDomains; preload (production only)."
-  },
-  {
-    header: "x-content-type-options",
-    severity: "low",
-    remediation: "Send `X-Content-Type-Options: nosniff`."
-  },
-  {
-    header: "x-frame-options",
-    severity: "medium",
-    remediation: "Send `X-Frame-Options: DENY` or use CSP `frame-ancestors`."
-  },
-  {
-    header: "referrer-policy",
-    severity: "low",
-    remediation: "Send `Referrer-Policy: strict-origin-when-cross-origin` or stricter."
-  },
-  {
-    header: "content-security-policy",
-    severity: "high",
-    remediation: "Define a strict CSP scoped to first-party origins."
-  }
-];
-var securityHeadersPrompt = {
-  id: "config.security-headers",
-  title: "Security response headers",
-  category: "headers",
-  severityFocus: "medium",
-  prompt: [
-    "Goal: Audit response headers for HSTS, X-Content-Type-Options, X-Frame-Options,",
-    "Referrer-Policy and CSP. Report each missing header per response.",
-    "",
-    "Evidence required: response headers from the root page and at least one HTML deeper page.",
-    "",
-    "Output: severity per header; confidence high."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const { url, headers } of eachHeaders(ev)) {
-      const isHtml2 = (findHeader(headers, "content-type") ?? "").includes("html");
-      if (!isHtml2) continue;
-      for (const check2 of REQUIRED) {
-        if (!findHeader(headers, check2.header)) {
-          findings.push({
-            title: `Missing security header: ${check2.header}`,
-            severity: check2.severity,
-            category: "headers",
-            description: `${url} response did not include the ${check2.header} header.`,
-            evidence: { url, missingHeader: check2.header },
-            impact: "Reduced defence in depth against browser-side attacks.",
-            remediation: check2.remediation,
-            confidence: "high"
-          });
-        }
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/config/error-leakage.prompt.ts
-var errorLeakagePrompt = {
-  id: "config.error-leakage",
-  title: "Stack trace and server banner leakage",
-  category: "configuration",
-  severityFocus: "medium",
-  prompt: [
-    "Goal: Detect responses that leak server banners, framework versions, or stack traces.",
-    "",
-    "Evidence required: Server / X-Powered-By headers; 5xx response bodies if any were captured.",
-    "",
-    "Output: severity medium; confidence high when headers were directly captured."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const findings = [];
-    for (const { url, headers } of eachHeaders(ev)) {
-      const server = findHeader(headers, "server");
-      const powered = findHeader(headers, "x-powered-by");
-      if (server && /\d/.test(server)) {
-        findings.push({
-          title: "Server banner discloses version",
-          severity: "low",
-          category: "configuration",
-          description: `${url} responds with Server: ${server}.`,
-          evidence: { url, server },
-          impact: "Version disclosure aids targeted exploit selection.",
-          remediation: "Strip or generalize the Server header in the reverse proxy / framework config.",
-          confidence: "high"
-        });
-      }
-      if (powered) {
-        findings.push({
-          title: "X-Powered-By header present",
-          severity: "low",
-          category: "configuration",
-          description: `${url} responds with X-Powered-By: ${powered}.`,
-          evidence: { url, xPoweredBy: powered },
-          impact: "Discloses framework / language to attackers.",
-          remediation: "Disable X-Powered-By in framework configuration.",
-          confidence: "high"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompts/infrastructure/dependency-risk.prompt.ts
-var dependencyRiskPrompt = {
-  id: "infrastructure.dependency-risk",
-  title: "Exposed dependency / version metadata",
-  category: "infrastructure",
-  severityFocus: "medium",
-  prompt: [
-    "Goal: Detect public exposure of package.json, composer.json, gemfile.lock or other",
-    "dependency manifests that disclose exact versions.",
-    "",
-    "Evidence required: 2xx responses to common dependency manifest paths.",
-    "",
-    "Output: severity medium; confidence high when directly fetched."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    const manifestPaths = ["/package.json", "/composer.json", "/Gemfile.lock", "/yarn.lock"];
-    const exposed = ev.pages.filter(
-      (p) => manifestPaths.some((m) => p.finalUrl.endsWith(m)) && p.status === 200
-    );
-    if (exposed.length === 0) return [];
-    return [
-      {
-        title: "Dependency manifest exposed publicly",
-        severity: "medium",
-        category: "infrastructure",
-        description: "A dependency manifest was served from a public URL. Attackers can map exact versions to known CVEs.",
-        evidence: { urls: exposed.map((p) => p.finalUrl) },
-        impact: "Targeted exploitation of known vulnerable versions.",
-        remediation: "Block these paths at the web server / CDN. Do not deploy them as static assets.",
-        confidence: "high"
-      }
-    ];
-  }
-};
-
-// src/core/prompt-engine/prompts/multi-tenant/tenant-isolation.prompt.ts
-var tenantIsolationPrompt = {
-  id: "multi-tenant.isolation",
-  title: "Multi-tenant data isolation",
-  category: "multi-tenant",
-  severityFocus: "critical",
-  prompt: [
-    "Goal: Verify tenant scoping is enforced server-side (not client-side via tenant_id query).",
-    "Detect responses where data from one tenant could be accessed by another principal.",
-    "",
-    "Evidence required: at least two test accounts in different tenants; identical endpoint",
-    "fetched by each; differential response codes and approximate body sizes.",
-    "",
-    "Constraints: never mutate cross-tenant data; read-only differential test.",
-    "",
-    "Output: severity critical when foreign tenant receives 2xx with data; confidence high only",
-    "when the differential probe was executed."
-  ].join("\n"),
-  heuristic(ctx) {
-    const ev = asScanEvidence(ctx.evidence);
-    if (!ev) return [];
-    if (ctx.testAccounts.length < 2) return [];
-    const probes = ev.roleProbes ?? {};
-    const roles = Object.keys(probes);
-    if (roles.length < 2) return [];
-    const [r1, r2] = [roles[0], roles[1]];
-    const aProbes = probes[r1] ?? [];
-    const bProbes = probes[r2] ?? [];
-    const aMap = new Map(aProbes.map((p) => [p.url, p]));
-    const findings = [];
-    for (const bp of bProbes) {
-      const ap = aMap.get(bp.url);
-      if (!ap) continue;
-      const both2xx = ap.status >= 200 && ap.status < 300 && bp.status >= 200 && bp.status < 300;
-      const sizeDelta = Math.abs(ap.bytes - bp.bytes);
-      if (both2xx && sizeDelta < 64) {
-        findings.push({
-          title: "Identical response sizes across two roles \u2014 verify tenant scoping",
-          severity: "high",
-          category: "multi-tenant",
-          description: `Endpoint ${bp.url} returned 2xx responses of nearly identical size to roles "${r1}" and "${r2}". This is unexpected if tenant scoping is enforced.`,
-          evidence: {
-            url: bp.url,
-            [r1]: { status: ap.status, bytes: ap.bytes },
-            [r2]: { status: bp.status, bytes: bp.bytes }
-          },
-          impact: "Cross-tenant data leakage; one tenant may see another's records.",
-          remediation: "Always scope queries by the authenticated tenant id derived from the session, never from the URL or body. Add an integration test that asserts tenant B receives 404 for tenant A's objects.",
-          confidence: "medium"
-        });
-      }
-    }
-    return findings;
-  }
-};
-
-// src/core/prompt-engine/prompt-registry.ts
-var PROMPT_REGISTRY = Object.freeze([
-  // access-control
-  idorPrompt,
-  bolaPrompt,
-  bflaPrompt,
-  roleEscalationPrompt,
-  privilegeEscalationPrompt,
-  // auth
-  authBypassPrompt,
-  jwtPrompt,
-  sessionPrompt,
-  passwordResetPrompt,
-  magicLinkPrompt,
-  oauthPrompt,
-  // injection
-  sqlInjectionPrompt,
-  nosqlInjectionPrompt,
-  commandInjectionPrompt,
-  xssPrompt,
-  ssrfPrompt,
-  pathTraversalPrompt,
-  // api-security
-  rateLimitPrompt,
-  massAssignmentPrompt,
-  excessiveDataExposurePrompt,
-  corsPrompt,
-  csrfPrompt,
-  openRedirectPrompt,
-  webhookPrompt,
-  sensitiveDataPrompt,
-  cachePoisoningPrompt,
-  deserializationPrompt,
-  // business-logic
-  paymentAbusePrompt,
-  couponAbusePrompt,
-  workflowBypassPrompt,
-  raceConditionPrompt,
-  // files
-  fileUploadPrompt,
-  insecureFileAccessPrompt,
-  // configuration
-  envLeakPrompt,
-  debugEndpointPrompt,
-  securityHeadersPrompt,
-  errorLeakagePrompt,
-  // infrastructure
-  dependencyRiskPrompt,
-  // multi-tenant
-  tenantIsolationPrompt
-]);
-
 // src/core/prompt-engine/prompt-loop-runner.ts
 async function runPromptLoop(input) {
   const env = getEnv();
@@ -41926,6 +42062,8 @@ function buildJsonReport(input) {
     summary,
     findings: sortFindings(input.findings),
     evidence: input.evidence,
+    coverageMatrix: input.coverageMatrix,
+    executiveSummary: input.executiveSummary,
     disclaimer: DISCLAIMER
   };
 }
@@ -41957,6 +42095,13 @@ function sortFindings(findings) {
 
 // src/core/reports/markdown-report.ts
 var SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"];
+var COVERAGE_ICON = {
+  clean: "\u2705 clean",
+  vulnerable: "\u{1F534} vulnerable",
+  partial: "\u{1F7E1} partial",
+  "not-applicable": "\u26AA n/a",
+  "not-tested": "\u23F3 untested"
+};
 function buildMarkdownReport(input) {
   const json = buildJsonReport(input);
   const lines = [];
@@ -41978,6 +42123,19 @@ function buildMarkdownReport(input) {
     lines.push(`| ${s} | ${json.summary.bySeverity[s]} |`);
   }
   lines.push("");
+  if (input.executiveSummary) {
+    lines.push("## Executive summary");
+    lines.push("");
+    lines.push(input.executiveSummary);
+    lines.push("");
+  }
+  const surface = extractAttackSurface(input.evidence);
+  if (surface) {
+    lines.push(...renderAttackSurface(surface));
+  }
+  if (input.coverageMatrix && input.coverageMatrix.length > 0) {
+    lines.push(...renderCoverageMatrix(input.coverageMatrix));
+  }
   lines.push("## Findings");
   lines.push("");
   if (json.findings.length === 0) {
@@ -42009,6 +42167,12 @@ function buildMarkdownReport(input) {
       lines.push("");
       lines.push(f.impact);
       lines.push("");
+      if (f.attackChain) {
+        lines.push("**Attack chain**");
+        lines.push("");
+        lines.push(f.attackChain);
+        lines.push("");
+      }
       lines.push("**Remediation**");
       lines.push("");
       lines.push(f.remediation);
@@ -42021,6 +42185,10 @@ function buildMarkdownReport(input) {
       lines.push("");
     });
   }
+  lines.push("## Prioritized remediation roadmap");
+  lines.push("");
+  lines.push(...renderRoadmap(json.findings));
+  lines.push("");
   lines.push("## Developer checklist");
   lines.push("");
   lines.push(buildChecklist(json.findings));
@@ -42033,6 +42201,77 @@ function buildMarkdownReport(input) {
 }
 function escapeMd(s) {
   return s.replace(/\|/g, "\\|");
+}
+function extractAttackSurface(evidence) {
+  if (evidence && typeof evidence === "object" && "attackSurface" in evidence) {
+    const s = evidence.attackSurface;
+    if (s && Array.isArray(s.endpoints)) return s;
+  }
+  return void 0;
+}
+function renderAttackSurface(s) {
+  const lines = [];
+  lines.push("## Attack surface map");
+  lines.push("");
+  lines.push(
+    `Everything an attacker can touch on this target. **${s.totalEndpoints}** endpoints discovered \u2014 ${s.withParams} take parameters, ${s.withPathId} expose object IDs, ${s.authGated} are auth-gated, ${s.forms} forms (${s.uploads} upload), ${s.adminLike} admin/internal-looking.`
+  );
+  lines.push("");
+  if (s.endpoints.length === 0) {
+    lines.push("_No endpoints were discovered \u2014 crawl may have been blocked or the target is single-page._");
+    lines.push("");
+    return lines;
+  }
+  lines.push("| Method | Endpoint | Params | ID | Auth | Form | Upload | Admin |");
+  lines.push("| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |");
+  for (const e of s.endpoints) {
+    lines.push(
+      `| ${e.method} | ${escapeMd(truncate(e.url, 80))} | ${mark(e.hasQueryParams)} | ${mark(e.hasPathId)} | ${mark(e.authGated)} | ${mark(e.hasForm)} | ${mark(e.isUpload)} | ${mark(e.looksAdmin)} |`
+    );
+  }
+  lines.push("");
+  return lines;
+}
+function renderCoverageMatrix(rows) {
+  const lines = [];
+  lines.push("## Goal coverage matrix");
+  lines.push("");
+  lines.push("Proof of what was tested. Every security goal evaluated during the audit, its verdict, and how much of the surface it covered.");
+  lines.push("");
+  lines.push("| Goal | Status | Endpoints tested | Notes |");
+  lines.push("| --- | --- | :-: | --- |");
+  for (const r of rows) {
+    const cover = r.endpointsTested != null && r.endpointsTotal != null ? `${r.endpointsTested}/${r.endpointsTotal}` : r.endpointsTested != null ? String(r.endpointsTested) : "\u2014";
+    const note = r.note ?? (r.endpoints && r.endpoints.length > 0 ? r.endpoints.join(", ") : "");
+    lines.push(
+      `| ${escapeMd(r.goalTitle ?? r.goalId)} | ${COVERAGE_ICON[r.status] ?? r.status} | ${cover} | ${escapeMd(truncate(note, 100))} |`
+    );
+  }
+  lines.push("");
+  return lines;
+}
+function renderRoadmap(findings) {
+  const actionable = findings.filter((f) => f.severity !== "info").sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity]);
+  if (actionable.length === 0) {
+    return ["_No actionable findings. Keep monitoring; absence of findings is not proof of safety._"];
+  }
+  const lines = ["Fix in this order \u2014 highest blast-radius first.", ""];
+  actionable.forEach((f, i) => {
+    lines.push(
+      `${i + 1}. **[${f.severity.toUpperCase()}]** ${escapeMd(f.title)} \u2014 ${escapeMd(firstSentence(f.remediation))}`
+    );
+  });
+  return lines;
+}
+function mark(v) {
+  return v ? "\u2713" : "\xB7";
+}
+function truncate(s, n) {
+  return s.length > n ? `${s.slice(0, n - 1)}\u2026` : s;
+}
+function firstSentence(s) {
+  const m = s.match(/^.*?[.!?](\s|$)/);
+  return (m ? m[0] : s).trim();
 }
 function buildChecklist(findings) {
   if (findings.length === 0) return "- [ ] Re-run with at least one populated allowlisted target.";
@@ -42169,6 +42408,12 @@ async function handleSecurityScan(input) {
   const request4 = input;
   let evidence = await crawlTarget({ request: request4, audit });
   evidence = await runBrowserChecks(request4, evidence, audit);
+  evidence.attackSurface = buildAttackSurface(evidence);
+  audit.event("attack-surface.built", {
+    endpoints: evidence.attackSurface.totalEndpoints,
+    authGated: evidence.attackSurface.authGated,
+    uploads: evidence.attackSurface.uploads
+  });
   const extraFindings = [];
   if (input.includeActiveProbes) {
     const probeFindings = await runActiveProbes({
@@ -42331,13 +42576,25 @@ var FindingSchema = external_exports.object({
   impact: external_exports.string(),
   remediation: external_exports.string(),
   confidence: external_exports.enum(["low", "medium", "high"]).optional(),
-  promptId: external_exports.string().optional()
+  promptId: external_exports.string().optional(),
+  attackChain: external_exports.string().optional()
+});
+var CoverageRowSchema = external_exports.object({
+  goalId: external_exports.string(),
+  goalTitle: external_exports.string().optional(),
+  status: external_exports.enum(["clean", "vulnerable", "partial", "not-applicable", "not-tested"]),
+  endpointsTested: external_exports.number().int().min(0).optional(),
+  endpointsTotal: external_exports.number().int().min(0).optional(),
+  endpoints: external_exports.array(external_exports.string()).optional(),
+  note: external_exports.string().optional()
 });
 var reportInputSchema = external_exports.object({
   targetUrl: external_exports.string().min(1),
   findings: external_exports.array(FindingSchema),
   evidence: external_exports.record(external_exports.unknown()),
-  scope: external_exports.array(external_exports.string()).optional()
+  scope: external_exports.array(external_exports.string()).optional(),
+  coverageMatrix: external_exports.array(CoverageRowSchema).optional(),
+  executiveSummary: external_exports.string().optional()
 });
 var reportToolDefinition = {
   name: "generate_report",
@@ -42348,7 +42605,16 @@ var reportToolDefinition = {
       targetUrl: { type: "string" },
       findings: { type: "array", items: { type: "object" } },
       evidence: { type: "object" },
-      scope: { type: "array", items: { type: "string" } }
+      scope: { type: "array", items: { type: "string" } },
+      coverageMatrix: {
+        type: "array",
+        description: "Optional goal-coverage matrix from an expert audit. One row per security goal: { goalId, goalTitle?, status: clean|vulnerable|partial|not-applicable|not-tested, endpointsTested?, endpointsTotal?, endpoints?, note? }.",
+        items: { type: "object" }
+      },
+      executiveSummary: {
+        type: "string",
+        description: 'Optional executive "are we safe now" narrative from an expert audit.'
+      }
     },
     required: ["targetUrl", "findings", "evidence"]
   }
@@ -42358,7 +42624,9 @@ async function handleGenerateReport(input) {
     targetUrl: input.targetUrl,
     scope: input.scope ?? [],
     findings: input.findings,
-    evidence: input.evidence
+    evidence: input.evidence,
+    coverageMatrix: input.coverageMatrix,
+    executiveSummary: input.executiveSummary
   });
   return {
     ok: true,

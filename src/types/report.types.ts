@@ -1,5 +1,5 @@
 import type { Finding, Severity } from './finding.types.js';
-import type { ScanEvidence, ScanType } from './scan.types.js';
+import type { CoverageRow, ScanEvidence, ScanType } from './scan.types.js';
 
 export interface ReportInput {
   targetUrl: string;
@@ -8,6 +8,13 @@ export interface ReportInput {
   findings: Finding[];
   evidence: ScanEvidence | Record<string, unknown>;
   generatedAt?: string;
+  /**
+   * Goal-coverage matrix produced by an expert audit. When present, the report
+   * renders a "Goal coverage" section proving which goals were tested.
+   */
+  coverageMatrix?: CoverageRow[];
+  /** Executive "are we safe now" narrative from an expert audit. */
+  executiveSummary?: string;
 }
 
 export interface ReportSummary {
@@ -31,5 +38,7 @@ export interface SerializedReport {
   summary: ReportSummary;
   findings: Finding[];
   evidence: ScanEvidence | Record<string, unknown>;
+  coverageMatrix?: CoverageRow[];
+  executiveSummary?: string;
   disclaimer: string;
 }
