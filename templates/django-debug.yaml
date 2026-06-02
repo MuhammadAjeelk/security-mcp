@@ -1,0 +1,22 @@
+id: django-debug-page
+info:
+  name: Django DEBUG page exposed
+  severity: high
+  description: Detects Django debug error pages which leak source code, settings, and environment.
+  tags: [configuration, django]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /__debug__/
+      - /not-a-real-path-smcp
+    matchersCondition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'You’re seeing this error because you have DEBUG = True'
+          - 'Django Version:'
+          - 'Request Method:'
+        condition: or

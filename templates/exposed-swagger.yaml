@@ -1,0 +1,27 @@
+id: exposed-swagger
+info:
+  name: Exposed Swagger / OpenAPI specification
+  severity: medium
+  description: Detects unauthenticated Swagger/OpenAPI documentation which discloses API surface.
+  tags: [configuration, api]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /swagger.json
+      - /openapi.json
+      - /swagger/v1/swagger.json
+      - /api-docs
+      - /api/swagger
+      - /docs/swagger.json
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - '"swagger"'
+          - '"openapi"'
+          - 'swagger:'
+        condition: or

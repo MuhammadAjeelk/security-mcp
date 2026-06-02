@@ -1,0 +1,15 @@
+id: missing-csp
+info:
+  name: Missing Content-Security-Policy
+  severity: medium
+  description: No Content-Security-Policy header set on the root page; reduces defence in depth against XSS.
+  tags: [headers]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchers:
+      - type: header
+        header: content-security-policy
+        negative: true

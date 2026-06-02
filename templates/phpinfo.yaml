@@ -1,0 +1,23 @@
+id: phpinfo-exposed
+info:
+  name: phpinfo() page exposed
+  severity: medium
+  description: phpinfo() pages disclose PHP version, loaded modules, environment, and configuration paths.
+  tags: [configuration, php]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /phpinfo.php
+      - /info.php
+      - /test.php
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - 'PHP Version'
+          - 'phpinfo()'
+        condition: or

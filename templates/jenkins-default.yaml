@@ -1,0 +1,22 @@
+id: jenkins-default
+info:
+  name: Jenkins login page exposed
+  severity: medium
+  description: Detects an exposed Jenkins instance. If unauthenticated build creation is possible this becomes critical.
+  tags: [exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /login
+    matchersCondition: or
+    matchers:
+      - type: header
+        header: x-jenkins
+      - type: word
+        part: body
+        words:
+          - 'Jenkins'
+          - 'data-jenkins-version'
+        condition: and

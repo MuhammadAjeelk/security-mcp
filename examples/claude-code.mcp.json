@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "security-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/security-mcp/dist/server.js"],
+      "env": {
+        "ALLOWED_STAGING_HOSTS": "staging.example.com,dev.example.com",
+        "SCAN_TIMEOUT_MS": "10000",
+        "SCAN_MAX_REQUESTS": "50",
+        "PROMPT_LOOP_MAX_ITERATIONS": "3",
+        "REPORTS_DIR": "/absolute/path/to/security-mcp/reports"
+      }
+    }
+  }
+}

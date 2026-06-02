@@ -1,0 +1,19 @@
+id: mongo-express
+info:
+  name: mongo-express UI exposed
+  severity: high
+  description: mongo-express web UI exposed — typically allows full DB administration.
+  tags: [exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200, 401]
+      - type: word
+        part: body
+        words:
+          - 'mongo-express'

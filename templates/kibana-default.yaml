@@ -1,0 +1,21 @@
+id: kibana-exposed
+info:
+  name: Kibana exposed
+  severity: medium
+  description: Detects an exposed Kibana dashboard. Default deployments may grant full Elasticsearch access.
+  tags: [exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /app/home
+      - /api/status
+    matchersCondition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'Kibana'
+          - '"version":'
+        condition: and

@@ -1,0 +1,21 @@
+id: flask-debug-page
+info:
+  name: Flask Werkzeug debugger exposed
+  severity: critical
+  description: The Werkzeug debugger allows arbitrary code execution via the in-browser console.
+  tags: [configuration, flask]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /console
+    matchersCondition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'Werkzeug Debugger'
+          - 'pin'
+          - 'PIN: '
+        condition: or

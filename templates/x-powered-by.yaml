@@ -1,0 +1,19 @@
+id: server-version-disclosure
+info:
+  name: Server or framework version disclosed
+  severity: low
+  description: X-Powered-By or detailed Server header discloses framework / language version.
+  tags: [configuration]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchersCondition: or
+    matchers:
+      - type: header
+        header: x-powered-by
+      - type: regex
+        part: header
+        regex:
+          - 'server:\s*\S+/\d'

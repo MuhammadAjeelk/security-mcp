@@ -1,0 +1,22 @@
+id: exposed-git-config
+info:
+  name: Exposed .git/config
+  severity: high
+  description: Detects publicly accessible .git directories which leak repository structure and history.
+  tags: [configuration, exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /.git/config
+      - /.git/HEAD
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - '[core]'
+          - 'ref:'
+        condition: or

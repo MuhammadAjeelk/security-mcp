@@ -1,0 +1,13 @@
+{
+  "name": "security-mcp",
+  "owner": {
+    "name": "security-mcp"
+  },
+  "plugins": [
+    {
+      "name": "security-mcp",
+      "source": "./",
+      "description": "Authorized security testing MCP for localhost and allowlisted staging targets. Adds /security-mcp:* slash commands and registers the security-mcp MCP server."
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+id: wordpress-readme
+info:
+  name: WordPress readme.html exposes version
+  severity: low
+  description: WordPress readme reveals the major version. Aids targeted exploitation.
+  tags: [exposure, wordpress]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /readme.html
+      - /wp-includes/version.php
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - 'WordPress'

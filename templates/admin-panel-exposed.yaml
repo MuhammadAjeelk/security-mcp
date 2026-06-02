@@ -1,0 +1,26 @@
+id: admin-panel-exposed
+info:
+  name: Generic admin panel discovered
+  severity: medium
+  description: Common admin paths returned 200 — verify authentication is enforced.
+  tags: [exposure, access-control]
+confidence: low
+requests:
+  - method: GET
+    paths:
+      - /admin
+      - /administrator
+      - /admin/login
+      - /admin.php
+      - /manager/html
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - 'login'
+          - 'password'
+          - 'admin'
+        condition: or

@@ -1,0 +1,19 @@
+id: redis-rest-exposed
+info:
+  name: RedisInsight / Redis web UI exposed
+  severity: medium
+  description: Detects exposed Redis web management interfaces.
+  tags: [exposure]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /
+      - /api/instance
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'RedisInsight'
+          - 'redis-stat'
+        condition: or

@@ -1,0 +1,22 @@
+id: apache-server-status
+info:
+  name: Apache mod_status / server-status exposed
+  severity: medium
+  description: Discloses request URIs, client IPs, and worker state.
+  tags: [configuration, apache]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /server-status
+      - /server-info
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - 'Apache Server Status'
+          - 'Server Version:'
+        condition: or

@@ -1,0 +1,15 @@
+id: missing-hsts
+info:
+  name: Missing Strict-Transport-Security
+  severity: medium
+  description: No HSTS header on the root response. Required for production https-only deployments.
+  tags: [headers]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchers:
+      - type: header
+        header: strict-transport-security
+        negative: true

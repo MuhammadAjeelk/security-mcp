@@ -1,0 +1,15 @@
+id: nextjs-build-info
+info:
+  name: Next.js _next/static manifest discloses bundle info
+  severity: low
+  description: Next.js exposes build-id manifests. Low risk on its own but useful for fingerprinting.
+  tags: [configuration, nextjs]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /_next/static/chunks/main.js
+      - /_next/data/
+    matchers:
+      - type: status
+        status: [200]

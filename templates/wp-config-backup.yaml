@@ -1,0 +1,24 @@
+id: wp-config-backup
+info:
+  name: WordPress wp-config backup file
+  severity: critical
+  description: Backup copies of wp-config.php frequently leak DB credentials and salts.
+  tags: [exposure, wordpress]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /wp-config.php.bak
+      - /wp-config.php~
+      - /wp-config.php.old
+      - /wp-config.bak
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - 'DB_PASSWORD'
+          - 'DB_NAME'
+        condition: or

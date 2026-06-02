@@ -1,0 +1,16 @@
+id: cors-null-origin
+info:
+  name: CORS allows null origin
+  severity: high
+  description: Sandboxed iframes and data: URLs gain credentialed access.
+  tags: [headers, api]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /api
+    matchers:
+      - type: header
+        header: access-control-allow-origin
+        words: ['null']

@@ -1,0 +1,24 @@
+id: backup-files-exposed
+info:
+  name: Common backup files exposed
+  severity: high
+  description: Detects backup files (.bak, .old, .swp) which often contain source code or secrets.
+  tags: [exposure]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /index.php.bak
+      - /index.php~
+      - /config.php.bak
+      - /backup.sql
+      - /backup.tar.gz
+      - /db.sql
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: header
+        regex:
+          - 'content-length:\s*[1-9]\d{2,}'

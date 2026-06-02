@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "security-mcp": {
+      "command": "node",
+      "args": ["/absolute/path/to/security-mcp/dist/server.js"],
+      "env": {
+        "ALLOWED_STAGING_HOSTS": "staging.example.com"
+      }
+    }
+  }
+}

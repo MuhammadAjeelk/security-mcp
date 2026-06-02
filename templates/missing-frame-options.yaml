@@ -1,0 +1,21 @@
+id: missing-frame-options
+info:
+  name: Missing X-Frame-Options / CSP frame-ancestors
+  severity: medium
+  description: Page can be framed by external sites — enables clickjacking.
+  tags: [headers]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchersCondition: and
+    matchers:
+      - type: header
+        header: x-frame-options
+        negative: true
+      - type: regex
+        part: header
+        regex:
+          - 'content-security-policy:[^\n]*frame-ancestors'
+        negative: true

@@ -1,0 +1,21 @@
+id: grafana-exposed
+info:
+  name: Grafana instance exposed
+  severity: medium
+  description: Detects an exposed Grafana instance. Default admin:admin must be changed.
+  tags: [exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /login
+      - /api/health
+    matchersCondition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'Grafana'
+          - '"commit"'
+        condition: and

@@ -1,0 +1,15 @@
+id: missing-content-type-options
+info:
+  name: Missing X-Content-Type-Options
+  severity: low
+  description: Browser will sniff response content type — small but real risk of MIME confusion.
+  tags: [headers]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchers:
+      - type: header
+        header: x-content-type-options
+        negative: true

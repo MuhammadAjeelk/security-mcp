@@ -1,0 +1,24 @@
+id: exposed-env-file
+info:
+  name: Exposed .env file
+  severity: critical
+  description: Detects publicly accessible .env configuration files which commonly leak secrets.
+  tags: [configuration, secrets]
+  reference:
+    - https://owasp.org/www-project-web-security-testing-guide/v42/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/06-Test_HTTP_Methods
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /.env
+      - /.env.local
+      - /.env.production
+      - /api/.env
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '^\s*[A-Z_][A-Z0-9_]*\s*='

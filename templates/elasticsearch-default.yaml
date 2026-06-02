@@ -1,0 +1,21 @@
+id: elasticsearch-exposed
+info:
+  name: Elasticsearch root exposed
+  severity: high
+  description: Exposed Elasticsearch nodes are commonly unauthenticated and allow full data read.
+  tags: [exposure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - '"cluster_name"'
+          - '"tagline"'
+        condition: and

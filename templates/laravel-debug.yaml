@@ -1,0 +1,21 @@
+id: laravel-debug
+info:
+  name: Laravel Ignition debug page
+  severity: critical
+  description: Laravel's Ignition debug page can leak source and (CVE-2021-3129) allow RCE on older versions.
+  tags: [configuration, laravel]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /
+      - /_ignition/health-check
+    matchersCondition: or
+    matchers:
+      - type: word
+        part: body
+        words:
+          - 'Whoops'
+          - 'Ignition'
+          - '_ignition'
+        condition: or

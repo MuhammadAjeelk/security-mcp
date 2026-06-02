@@ -1,0 +1,27 @@
+id: exposed-package-json
+info:
+  name: Exposed package.json / lockfile
+  severity: low
+  description: Detects publicly accessible dependency manifests that disclose exact versions.
+  tags: [configuration, infrastructure]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /package.json
+      - /package-lock.json
+      - /yarn.lock
+      - /composer.json
+      - /composer.lock
+      - /Gemfile.lock
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '"dependencies"'
+          - 'version "[0-9]'
+          - 'GEM\s+remote:'
+        condition: or
