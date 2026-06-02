@@ -1,7 +1,9 @@
 {
   "name": "security-mcp",
+  "description": "Marketplace for the security-mcp plugin — authorized security testing for localhost and allowlisted staging targets.",
   "owner": {
-    "name": "security-mcp"
+    "name": "MuhammadAjeelk",
+    "url": "https://github.com/MuhammadAjeelk"
   },
   "plugins": [
     {
