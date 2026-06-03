@@ -107,9 +107,33 @@ Hand the probing off to the **Ralph Loop** plugin so it persists across iteratio
    ```
    Authorized security audit of <TARGET> via the security-mcp plugin. Rules of engagement
    unchanged: non-destructive only, severity+confidence on every finding, stay in target policy,
-   only escalate accounts you created.
+   only escalate accounts you created. END GOAL: full system takeover (see PRIMARY OBJECTIVE).
 
-   THIS ITERATION TARGETS EXACTLY ONE ROUTE — finish it before any other.
+   ===== PRIMARY OBJECTIVE — TAKE OVER THE ADMIN PANEL (pursue FIRST, it is the win) =====
+   Every app here has an admin panel; reaching it = takeover. Track this in
+   ./reports/<HOST>-admin-takeover.md with one status: NOT_STARTED -> attempting -> ACHIEVED/BLOCKED.
+   While its status is not ACHIEVED/BLOCKED, spend the iteration here instead of generic routes:
+   1. Locate the admin surface: routes flagged looksAdmin, /admin /dashboard /manage /internal in
+      the crawl, and admin-tagged operations in the OpenAPI spec (incl. its UI page if any).
+   2. Become a normal user: self-register (Step 1.5) + beat any verification gate (Step 1.6 / 1.7).
+   3. *** Post-auth role escalation via PROFILE UPDATE — the highest-yield path. *** Apps often
+      validate `role` at REGISTRATION but forget to whitelist it on profile/account update. As your
+      normal user, send the privilege fields to EVERY self-mutating endpoint — PATCH/PUT /me,
+      /profile, /account, /users/{ownId}, /settings, /account/preferences — in JSON, form, and
+      nested ({"user":{"role":"admin"}}) shapes:
+         role=admin  roles=["admin"]  isAdmin=true  is_admin=true  admin=true  isStaff=true
+         isSuperuser=true  permissions=["*"]  groups=["administrators"]  accountType=admin
+         tier=admin  type=admin  organizationRole=owner
+      Then RE-READ your own profile + decode your JWT/session claims to see if it persisted.
+   4. Confirm takeover: with the (maybe-)elevated identity, call the admin-panel routes from #1.
+      A 200 + admin data/function that a normal user must not reach = ADMIN TAKEOVER (critical).
+   5. Also try the unauth/low-priv admin-access paths from playbook Section B (BFLA: method swap,
+      X-Original-URL/XFF/Role header tricks, path-normalization) directly against admin routes.
+   Mark ACHIEVED (write the full chain + exact requests to <HOST>-findings.md, then STOP at proof —
+   do not pillage) or BLOCKED (record which control held: server-side allowlist / forbidNonWhitelisted
+   / per-route role guard). Only then drop to the secondary objective.
+
+   ===== SECONDARY OBJECTIVE — per-route coverage (one route per iteration) =====
    1. Read ./reports/<HOST>-routes.md. Pick the FIRST route with any applicable goal still
       `not-tested`, prioritising auth-gated / path-id / admin / api-like routes.
    2. Against THAT ONE route ONLY, drive every applicable goal to a verdict using the full
@@ -127,10 +151,13 @@ Hand the probing off to the **Ralph Loop** plugin so it persists across iteratio
    auth-dependent goals `partial` ("no credential") and move on — do NOT burn iterations
    re-hitting it. Note that supplying --account tokens is the unlock.
 
-   Emit <promise>AUDIT_COVERAGE_COMPLETE</promise> ONLY when EVERY route in the matrix has zero
-   remaining `not-tested` applicable goals. Never emit it just to escape a slow loop.
+   BOUNDED, NOT INFINITE. Emit <promise>AUDIT_COVERAGE_COMPLETE</promise> when BOTH are true:
+   (a) the admin-takeover objective is ACHIEVED or BLOCKED, and (b) every route in the matrix has
+   zero remaining `not-tested` applicable goals. The --max-iterations cap is a hard stop — if you
+   hit it, emit the promise with whatever coverage you reached and report it honestly. Never emit
+   the promise just to escape a slow loop, and never loop past the cap.
    ```
-3. When the loop fires the completion promise, read `./reports/<HOST>-routes.md` + `./reports/<HOST>-findings.md` and proceed to Step 3, collapsing the per-route matrix into the goal coverage matrix.
+3. When the loop fires the completion promise, read `./reports/<HOST>-routes.md`, `./reports/<HOST>-admin-takeover.md` + `./reports/<HOST>-findings.md` and proceed to Step 3, collapsing the per-route matrix into the goal coverage matrix.
 
 > Prefer this Ralph-driven per-route loop. If the Ralph Loop plugin is unavailable, fall back to a single-session loop bounded by `maxIterations`, still iterating route-by-route to a verdict before moving on.
 
