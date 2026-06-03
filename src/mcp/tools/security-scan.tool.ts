@@ -5,6 +5,7 @@ import { runBrowserChecks } from '../../core/scanner/browser-scanner.js';
 import { buildAttackSurface } from '../../core/scanner/attack-surface.js';
 import { runActiveProbes } from '../../core/scanner/probe-runner.js';
 import { autoRegister } from '../../core/scanner/auto-register.js';
+import { bruteForceNumericCode } from '../../core/scanner/brute-forcer.js';
 import { findApiPayload } from '../../core/scanner/api-payload-finder.js';
 import { probeAccessControl } from '../../core/scanner/access-control-prober.js';
 import { runTemplates } from '../../core/templates/template-runner.js';
@@ -29,6 +30,17 @@ const AuthSessionSchema = z.object({
   origin: z.string().optional(),
 });
 
+const BruteForceSpecSchema = z.object({
+  url: z.string().min(1),
+  method: z.string().optional(),
+  codeParam: z.string().min(1),
+  codeLength: z.number().int().min(1).max(10),
+  staticFields: z.record(z.string(), z.unknown()).optional(),
+  encoding: z.enum(['json', 'form', 'query']).optional(),
+  successStatuses: z.array(z.number().int()).optional(),
+  successBodyRegex: z.string().optional(),
+});
+
 export const securityScanInputSchema = z.object({
   targetUrl: z.string().min(1),
   scanType: z.enum(['quick', 'standard', 'deep']),
@@ -39,6 +51,12 @@ export const securityScanInputSchema = z.object({
   includeContentDiscovery: z.boolean().optional(),
   registerAccounts: z.boolean().optional(),
   includeServerSidePromptLoop: z.boolean().optional(),
+  /**
+   * Authorized brute-force targets (verification/OTP/reset codes). Each runs a
+   * rate-limit precheck first and ONLY sweeps the keyspace if no throttling is
+   * found — a throttled endpoint aborts as the secure outcome.
+   */
+  bruteForce: z.array(BruteForceSpecSchema).optional(),
   session: AuthSessionSchema.optional(),
   allowedHosts: z.array(z.string()).optional(),
   testAccounts: z.array(TestAccountSchema).optional(),
@@ -76,6 +94,25 @@ export const securityScanToolDefinition = {
         type: 'boolean',
         description:
           'Self-register throwaway accounts via the public signup flow and probe for mass-assignment privilege escalation. Own-account only, non-destructive.',
+      },
+      bruteForce: {
+        type: 'array',
+        description:
+          'Authorized brute-force of guessable codes (verification/OTP/reset PINs). Each target runs a rate-limit precheck and ONLY sweeps the keyspace if no throttling is detected; throttling aborts the run. Use only on authorized targets.',
+        items: {
+          type: 'object',
+          properties: {
+            url: { type: 'string' },
+            method: { type: 'string' },
+            codeParam: { type: 'string' },
+            codeLength: { type: 'number', minimum: 1, maximum: 10 },
+            staticFields: { type: 'object' },
+            encoding: { type: 'string', enum: ['json', 'form', 'query'] },
+            successStatuses: { type: 'array', items: { type: 'number' } },
+            successBodyRegex: { type: 'string' },
+          },
+          required: ['url', 'codeParam', 'codeLength'],
+        },
       },
       includeServerSidePromptLoop: {
         type: 'boolean',
@@ -233,6 +270,48 @@ export async function handleSecurityScan(input: SecurityScanInput) {
     }
   }
 
+  // Authorized brute-force: prove (or refute) a missing-rate-limit vulnerability
+  // on guessable-code endpoints. Aborts safely if the endpoint throttles.
+  if (input.bruteForce && input.bruteForce.length > 0) {
+    for (const target of input.bruteForce) {
+      try {
+        const r = await bruteForceNumericCode({
+          ...target,
+          account: input.testAccounts?.[0],
+          session: input.session,
+          extraAllowedHosts: input.allowedHosts,
+          audit,
+        });
+        if (r.found || (!r.rateLimited && !r.aborted)) {
+          extraFindings.push({
+            id: `brute.${target.codeParam}.${shortId(target.url)}`,
+            title: r.found
+              ? `Brute-forceable secret cracked: ${target.codeParam} on ${target.url}`
+              : `No rate limiting on ${target.url} (${target.codeParam} brute-forceable)`,
+            severity: r.found ? 'critical' : 'high',
+            category: 'auth',
+            description:
+              `${r.note} A ${target.codeLength}-digit ${target.codeParam} has only ` +
+              `${10 ** target.codeLength} possibilities; with no rate limiting it is exhaustively ` +
+              `guessable.` + (r.found ? ` Accepted value: ${r.found}.` : ''),
+            evidence: { url: target.url, codeParam: target.codeParam, ...r },
+            impact: r.found
+              ? 'Account activation/verification or auth step bypassed via brute force → account takeover.'
+              : 'Missing rate limiting makes codes/credentials exhaustively guessable.',
+            remediation:
+              'Add strict rate limiting + lockout on the code/credential endpoint (per-account and per-IP), ' +
+              'use long high-entropy codes, expire them quickly, and cap verification attempts.',
+            confidence: r.found ? 'high' : 'medium',
+            promptId: 'api.rate-limit',
+          });
+        }
+        audit.event('brute.done', { url: target.url, found: !!r.found, rateLimited: r.rateLimited, attempts: r.attempts });
+      } catch (err) {
+        audit.event('brute.error', { url: target.url, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+
   if (input.includeActiveProbes) {
     const probeFindings = await runActiveProbes({
       endpoints: evidence.endpoints,
@@ -308,4 +387,11 @@ export async function handleSecurityScan(input: SecurityScanInput) {
     nextStep:
       'For deeper reasoning, call list_security_prompts to fetch the prompt library, apply each against the returned evidence, and submit any additional findings via generate_report.',
   };
+}
+
+/** Stable short id fragment from a URL, for finding ids. */
+function shortId(url: string): string {
+  let h = 0;
+  for (let i = 0; i < url.length; i++) h = (Math.imul(31, h) + url.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
 }

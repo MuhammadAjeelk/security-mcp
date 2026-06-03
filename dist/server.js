@@ -36863,6 +36863,16 @@ var EnvSchema = external_exports.object({
   SCAN_PROBE_MAX_TARGETS: external_exports.coerce.number().int().min(1).default(40),
   /** Max endpoints re-probed per role in the multi-role differential. */
   SCAN_ROLE_PROBE_MAX: external_exports.coerce.number().int().min(1).default(40),
+  /**
+   * Brute-force engine (auto-fires only when the rate-limit precheck finds NO
+   * effective throttling). Hard ceiling on attempts per target — default covers
+   * a full 6-digit keyspace. Lower it to bound load on your own server.
+   */
+  SCAN_BRUTE_MAX: external_exports.coerce.number().int().min(0).default(1e6),
+  /** Concurrent in-flight requests during a brute-force run. */
+  SCAN_BRUTE_CONCURRENCY: external_exports.coerce.number().int().min(1).max(100).default(20),
+  /** Requests sent in the rate-limit precheck burst before brute-forcing. */
+  SCAN_RATELIMIT_SAMPLE: external_exports.coerce.number().int().min(3).default(20),
   PROMPT_LOOP_MAX_ITERATIONS: external_exports.coerce.number().int().positive().default(3),
   REPORTS_DIR: external_exports.string().default("./reports"),
   LLM_PROVIDER: external_exports.enum(["mock", "anthropic"]).default("mock"),
@@ -40703,6 +40713,158 @@ function pathOf2(url) {
   }
 }
 
+// src/core/scanner/brute-forcer.ts
+var THROTTLE_STATUSES = /* @__PURE__ */ new Set([429, 503]);
+var THROTTLE_ABORT_RATIO = 0.3;
+async function bruteForceNumericCode(spec) {
+  const env = getEnv();
+  const method = (spec.method ?? "POST").toUpperCase();
+  const successStatuses = new Set(spec.successStatuses ?? [200, 201, 204, 302]);
+  const successRe = spec.successBodyRegex ? safeRegex(spec.successBodyRegex) : null;
+  const space = Math.min(10 ** spec.codeLength, env.SCAN_BRUTE_MAX);
+  const decision = validateTarget(spec.url, { extraAllowedHosts: spec.extraAllowedHosts });
+  if (!decision.allowed) {
+    return {
+      rateLimited: false,
+      attempts: 0,
+      aborted: true,
+      abortReason: `target rejected by policy: ${decision.reason}`,
+      note: "Brute-force not started \u2014 target out of scope."
+    };
+  }
+  const sample = Math.min(env.SCAN_RATELIMIT_SAMPLE, space);
+  spec.audit.event("brute.precheck.start", { url: spec.url, sample });
+  let throttledInSample = 0;
+  for (let i = 0; i < sample; i++) {
+    const code = pad(i, spec.codeLength);
+    const res = await attempt(spec, method, code).catch(() => null);
+    if (!res) continue;
+    if (THROTTLE_STATUSES.has(res.status) || res.headers["retry-after"]) throttledInSample++;
+    if (isSuccess(res, successStatuses, successRe)) {
+      return {
+        rateLimited: false,
+        found: code,
+        attempts: i + 1,
+        aborted: false,
+        note: `Code accepted after ${i + 1} attempts \u2014 no rate limiting.`
+      };
+    }
+  }
+  if (throttledInSample / sample >= THROTTLE_ABORT_RATIO) {
+    spec.audit.event("brute.precheck.throttled", { url: spec.url, throttledInSample, sample });
+    return {
+      rateLimited: true,
+      attempts: sample,
+      aborted: true,
+      abortReason: "rate limiting detected in precheck",
+      note: "Rate limiting / throttling is active on this endpoint \u2014 brute-force aborted (secure)."
+    };
+  }
+  spec.audit.event("brute.sweep.start", { url: spec.url, space, concurrency: env.SCAN_BRUTE_CONCURRENCY });
+  let next = sample;
+  let attempts = sample;
+  let found;
+  let aborted2 = false;
+  let abortReason;
+  const recent = [];
+  async function worker() {
+    while (!found && !aborted2) {
+      const i = next++;
+      if (i >= space) return;
+      const code = pad(i, spec.codeLength);
+      let res = null;
+      try {
+        res = await attempt(spec, method, code);
+      } catch {
+        res = null;
+      }
+      attempts++;
+      if (!res) continue;
+      const throttled = THROTTLE_STATUSES.has(res.status) || !!res.headers["retry-after"];
+      recent.push(throttled);
+      if (recent.length > 40) recent.shift();
+      if (recent.length >= 20 && recent.filter(Boolean).length / recent.length >= THROTTLE_ABORT_RATIO) {
+        aborted2 = true;
+        abortReason = "throttling appeared mid-run \u2014 backed off";
+        return;
+      }
+      if (isSuccess(res, successStatuses, successRe)) {
+        found = code;
+        return;
+      }
+    }
+  }
+  const workers = Array.from({ length: env.SCAN_BRUTE_CONCURRENCY }, () => worker());
+  await Promise.all(workers);
+  if (found) {
+    spec.audit.event("brute.sweep.cracked", { url: spec.url, attempts });
+    return {
+      rateLimited: false,
+      found,
+      attempts,
+      aborted: false,
+      note: `Secret cracked in ${attempts} attempts \u2014 endpoint has NO rate limiting.`
+    };
+  }
+  if (aborted2) {
+    spec.audit.event("brute.sweep.aborted", { url: spec.url, attempts, abortReason });
+    return {
+      rateLimited: abortReason?.includes("throttl") ?? false,
+      attempts,
+      aborted: true,
+      abortReason,
+      note: `Brute-force aborted after ${attempts} attempts: ${abortReason}.`
+    };
+  }
+  spec.audit.event("brute.sweep.exhausted", { url: spec.url, attempts });
+  return {
+    rateLimited: false,
+    attempts,
+    aborted: false,
+    note: attempts >= space && space < 10 ** spec.codeLength ? `Exhausted SCAN_BRUTE_MAX (${space}) without success \u2014 no throttling seen; raise the cap to finish the keyspace.` : `Swept ${attempts} candidates without a hit; no throttling observed.`
+  };
+}
+async function attempt(spec, method, code) {
+  const fields = { ...spec.staticFields ?? {}, [spec.codeParam]: code };
+  const encoding = spec.encoding ?? "json";
+  if (encoding === "query") {
+    const u = new URL(spec.url);
+    for (const [k, v] of Object.entries(fields)) u.searchParams.set(k, String(v));
+    return sendRequest({
+      url: u.toString(),
+      method,
+      account: spec.account,
+      session: spec.session,
+      extraAllowedHosts: spec.extraAllowedHosts
+    });
+  }
+  const isForm = encoding === "form";
+  const body = isForm ? new URLSearchParams(Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, String(v)]))).toString() : JSON.stringify(fields);
+  return sendRequest({
+    url: spec.url,
+    method,
+    headers: { "content-type": isForm ? "application/x-www-form-urlencoded" : "application/json" },
+    body,
+    account: spec.account,
+    session: spec.session,
+    extraAllowedHosts: spec.extraAllowedHosts
+  });
+}
+function isSuccess(res, statuses, re) {
+  if (re && re.test(res.body)) return true;
+  return statuses.has(res.status) && !THROTTLE_STATUSES.has(res.status);
+}
+function pad(n, len) {
+  return n.toString().padStart(len, "0");
+}
+function safeRegex(src) {
+  try {
+    return new RegExp(src, "i");
+  } catch {
+    return null;
+  }
+}
+
 // src/core/scanner/api-payload-finder.ts
 var COMMON_SEED_FIELDS = ["email", "name", "username", "title", "id"];
 async function findApiPayload(opts) {
@@ -44109,6 +44271,16 @@ var AuthSessionSchema = external_exports.object({
   bearerToken: external_exports.string().optional(),
   origin: external_exports.string().optional()
 });
+var BruteForceSpecSchema = external_exports.object({
+  url: external_exports.string().min(1),
+  method: external_exports.string().optional(),
+  codeParam: external_exports.string().min(1),
+  codeLength: external_exports.number().int().min(1).max(10),
+  staticFields: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
+  encoding: external_exports.enum(["json", "form", "query"]).optional(),
+  successStatuses: external_exports.array(external_exports.number().int()).optional(),
+  successBodyRegex: external_exports.string().optional()
+});
 var securityScanInputSchema = external_exports.object({
   targetUrl: external_exports.string().min(1),
   scanType: external_exports.enum(["quick", "standard", "deep"]),
@@ -44119,6 +44291,12 @@ var securityScanInputSchema = external_exports.object({
   includeContentDiscovery: external_exports.boolean().optional(),
   registerAccounts: external_exports.boolean().optional(),
   includeServerSidePromptLoop: external_exports.boolean().optional(),
+  /**
+   * Authorized brute-force targets (verification/OTP/reset codes). Each runs a
+   * rate-limit precheck first and ONLY sweeps the keyspace if no throttling is
+   * found — a throttled endpoint aborts as the secure outcome.
+   */
+  bruteForce: external_exports.array(BruteForceSpecSchema).optional(),
   session: AuthSessionSchema.optional(),
   allowedHosts: external_exports.array(external_exports.string()).optional(),
   testAccounts: external_exports.array(TestAccountSchema).optional()
@@ -44148,6 +44326,24 @@ var securityScanToolDefinition = {
       registerAccounts: {
         type: "boolean",
         description: "Self-register throwaway accounts via the public signup flow and probe for mass-assignment privilege escalation. Own-account only, non-destructive."
+      },
+      bruteForce: {
+        type: "array",
+        description: "Authorized brute-force of guessable codes (verification/OTP/reset PINs). Each target runs a rate-limit precheck and ONLY sweeps the keyspace if no throttling is detected; throttling aborts the run. Use only on authorized targets.",
+        items: {
+          type: "object",
+          properties: {
+            url: { type: "string" },
+            method: { type: "string" },
+            codeParam: { type: "string" },
+            codeLength: { type: "number", minimum: 1, maximum: 10 },
+            staticFields: { type: "object" },
+            encoding: { type: "string", enum: ["json", "form", "query"] },
+            successStatuses: { type: "array", items: { type: "number" } },
+            successBodyRegex: { type: "string" }
+          },
+          required: ["url", "codeParam", "codeLength"]
+        }
       },
       includeServerSidePromptLoop: {
         type: "boolean",
@@ -44278,6 +44474,36 @@ async function handleSecurityScan(input) {
       extraFindings.push(...bflaFindings);
     }
   }
+  if (input.bruteForce && input.bruteForce.length > 0) {
+    for (const target of input.bruteForce) {
+      try {
+        const r = await bruteForceNumericCode({
+          ...target,
+          account: input.testAccounts?.[0],
+          session: input.session,
+          extraAllowedHosts: input.allowedHosts,
+          audit
+        });
+        if (r.found || !r.rateLimited && !r.aborted) {
+          extraFindings.push({
+            id: `brute.${target.codeParam}.${shortId(target.url)}`,
+            title: r.found ? `Brute-forceable secret cracked: ${target.codeParam} on ${target.url}` : `No rate limiting on ${target.url} (${target.codeParam} brute-forceable)`,
+            severity: r.found ? "critical" : "high",
+            category: "auth",
+            description: `${r.note} A ${target.codeLength}-digit ${target.codeParam} has only ${10 ** target.codeLength} possibilities; with no rate limiting it is exhaustively guessable.` + (r.found ? ` Accepted value: ${r.found}.` : ""),
+            evidence: { url: target.url, codeParam: target.codeParam, ...r },
+            impact: r.found ? "Account activation/verification or auth step bypassed via brute force \u2192 account takeover." : "Missing rate limiting makes codes/credentials exhaustively guessable.",
+            remediation: "Add strict rate limiting + lockout on the code/credential endpoint (per-account and per-IP), use long high-entropy codes, expire them quickly, and cap verification attempts.",
+            confidence: r.found ? "high" : "medium",
+            promptId: "api.rate-limit"
+          });
+        }
+        audit.event("brute.done", { url: target.url, found: !!r.found, rateLimited: r.rateLimited, attempts: r.attempts });
+      } catch (err) {
+        audit.event("brute.error", { url: target.url, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
   if (input.includeActiveProbes) {
     const probeFindings = await runActiveProbes({
       endpoints: evidence.endpoints,
@@ -44340,6 +44566,11 @@ async function handleSecurityScan(input) {
     findings: allFindings,
     nextStep: "For deeper reasoning, call list_security_prompts to fetch the prompt library, apply each against the returned evidence, and submit any additional findings via generate_report."
   };
+}
+function shortId(url) {
+  let h = 0;
+  for (let i = 0; i < url.length; i++) h = Math.imul(31, h) + url.charCodeAt(i) | 0;
+  return (h >>> 0).toString(36);
 }
 
 // src/mcp/tools/validate-target.tool.ts

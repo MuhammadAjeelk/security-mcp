@@ -31,6 +31,16 @@ const EnvSchema = z.object({
   SCAN_PROBE_MAX_TARGETS: z.coerce.number().int().min(1).default(40),
   /** Max endpoints re-probed per role in the multi-role differential. */
   SCAN_ROLE_PROBE_MAX: z.coerce.number().int().min(1).default(40),
+  /**
+   * Brute-force engine (auto-fires only when the rate-limit precheck finds NO
+   * effective throttling). Hard ceiling on attempts per target — default covers
+   * a full 6-digit keyspace. Lower it to bound load on your own server.
+   */
+  SCAN_BRUTE_MAX: z.coerce.number().int().min(0).default(1_000_000),
+  /** Concurrent in-flight requests during a brute-force run. */
+  SCAN_BRUTE_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(20),
+  /** Requests sent in the rate-limit precheck burst before brute-forcing. */
+  SCAN_RATELIMIT_SAMPLE: z.coerce.number().int().min(3).default(20),
   PROMPT_LOOP_MAX_ITERATIONS: z.coerce.number().int().positive().default(3),
   REPORTS_DIR: z.string().default('./reports'),
   LLM_PROVIDER: z.enum(['mock', 'anthropic']).default('mock'),

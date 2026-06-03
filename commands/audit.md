@@ -13,8 +13,9 @@ Parse `$ARGUMENTS`:
 ## Non-negotiable rules of engagement
 
 1. **Scope:** Only act within the security-mcp target policy. Call `validate_target` first; if it rejects the URL, STOP and report why.
-2. **Non-destructive only.** You send crafted but SAFE probes (benign SQLi markers, reflected-XSS canaries, read-only IDOR id-swaps, header/CORS checks). You **never** modify or delete data belonging to existing users/tenants, never run destructive payloads, never brute-force, never DoS. Max 3 variants per endpoint.
+2. **Non-destructive only.** You send crafted but SAFE probes (benign SQLi markers, reflected-XSS canaries, read-only IDOR id-swaps, header/CORS checks). You **never** modify or delete data belonging to existing users/tenants, never run destructive payloads, never DoS. Max 3 variants per endpoint (except the brute-force engine in Step 1.7).
    - **Allowed exception — self-registration:** creating your *own* throwaway account through the application's public signup flow is a legitimate, low-impact user action and IS permitted (see Step 1.5). Operate only on accounts you create; never tamper with existing accounts or data.
+   - **Allowed exception — rate-limit-gated brute-force:** brute-forcing a guessable code (verification/OTP/reset PIN) IS permitted to prove a missing-rate-limit vulnerability (Step 1.7), but ONLY via the `security_scan` `bruteForce` engine, which first confirms the endpoint does not throttle and aborts the moment it does. Never hand-roll an unbounded request flood; never brute-force a throttled endpoint.
 3. **Evidence or it didn't happen.** Every finding carries `severity` + `confidence`. Never claim certainty without concrete evidence. Use `confidence: low` when reasoning is speculative.
 4. **You are the brain.** Do NOT set `includeServerSidePromptLoop`. The MCP collects evidence and runs deterministic checks; YOU do the reasoning.
 
@@ -55,6 +56,25 @@ If signup succeeds but **login is blocked pending email/SMS verification**, do n
 5. **Admin/internal force-verify route.** Check the spec for a `force-verify`/`activate`/admin-user-update route reachable unauthenticated or by a low-priv account.
 
 If any of 1–5 works → write it up as a **critical** finding (verification/activation bypass, with the exact request) **and** capture the now-valid session and continue from Step 1.5 #4 to run the full authenticated sweep. If all fail, the gate holds — record that (it's a `clean` verdict for the bypass) and mark the deeper authenticated goals `partial` ("needs a verified credential").
+
+### Step 1.7 — Brute-force guessable codes when there is NO rate limit
+A numeric verification/OTP/2FA/reset code with no rate limiting is exhaustively guessable (a 6-digit code = 1,000,000 tries), so brute-forcing it is the correct way to *prove* the missing control — and cracking it bypasses the gate. **Auto-run this** whenever you hit a guessable-code endpoint; the engine itself enforces the rate-limit gate so you don't have to decide.
+
+For each brute-forceable surface you find — email/phone **verification codes**, **password-reset PINs**, **2FA/OTP**, or any short numeric token the spec/flow exposes — call `security_scan` with a `bruteForce` entry:
+```json
+{ "targetUrl": "<base>", "scanType": "quick",
+  "bruteForce": [
+    { "url": "<verify endpoint>", "method": "POST", "codeParam": "code",
+      "codeLength": 6, "staticFields": { "email": "<your throwaway account>" },
+      "encoding": "json", "successStatuses": [200,201,302] }
+  ] }
+```
+How the engine keeps it safe (and what it means for your verdict):
+- It first sends a **rate-limit precheck burst**. If the endpoint throttles (429/`Retry-After`/sustained block) it **aborts** — that is the *secure* result → mark `rate-limiting` **clean** for that endpoint and move on.
+- If there is **no throttling**, it sweeps the full keyspace (up to `SCAN_BRUTE_MAX`, default 1,000,000) at bounded concurrency, **stops on the first accepted code**, and backs off instantly if throttling appears mid-run.
+- A returned `found` code → **critical** (auth/activation bypass): record it, capture the resulting session, and continue the authenticated sweep (Step 1.5 #4). No `found` but no throttling either → **high** "no rate limiting" finding (the engine already emits both).
+
+Point it at **any** API where a short secret guards access — not just signup. Brute-force is bounded by `SCAN_BRUTE_MAX` / `SCAN_BRUTE_CONCURRENCY`; raise them for a larger keyspace, lower them to be gentle on your own server. (This is the one place the audit issues high-volume requests — it only ever fires after confirming the target does not rate-limit, and only against the authorized scope.)
 
 ### Step 2 — Per-route Ralph Loop (one API at a time, until its goals are met)
 
