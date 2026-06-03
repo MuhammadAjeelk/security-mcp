@@ -7,7 +7,6 @@ import { PROBE_LIBRARY, type ProbeDefinition, type ProbeOutcome } from './probe-
 import type { Finding } from '../../types/finding.types.js';
 import type { DiscoveredEndpoint, TestAccount } from '../../types/scan.types.js';
 
-const MAX_PROBE_TARGETS = 10;
 const MAX_PROBES_PER_TARGET = 4;
 
 export interface ActiveProbeInput {
@@ -23,7 +22,7 @@ export interface ActiveProbeInput {
  */
 export async function runActiveProbes(input: ActiveProbeInput): Promise<Finding[]> {
   const env = getEnv();
-  const targets = pickProbeTargets(input.endpoints);
+  const targets = pickProbeTargets(input.endpoints, env.SCAN_PROBE_MAX_TARGETS);
   if (targets.length === 0) return [];
 
   input.audit.event('probes.start', { targets: targets.length, probes: PROBE_LIBRARY.length });
@@ -57,17 +56,23 @@ export async function runActiveProbes(input: ActiveProbeInput): Promise<Finding[
   return findings;
 }
 
-function pickProbeTargets(endpoints: DiscoveredEndpoint[]): DiscoveredEndpoint[] {
+function pickProbeTargets(endpoints: DiscoveredEndpoint[], maxTargets: number): DiscoveredEndpoint[] {
+  // Probe input-bearing/API endpoints first, then everything else — but cover
+  // every discovered route up to the (configurable) budget rather than a fixed 10.
   const candidates = endpoints.filter(
-    (e) => /[?&]/.test(e.url) || /\/(api|search|filter|q|id)\b/i.test(e.url),
+    (e) =>
+      /[?&]/.test(e.url) ||
+      /\/(api|search|filter|q|id|graphql|rest)\b/i.test(e.url) ||
+      e.method !== 'GET',
   );
   const seen = new Set<string>();
   const out: DiscoveredEndpoint[] = [];
   for (const e of [...candidates, ...endpoints]) {
-    if (seen.has(e.url)) continue;
-    seen.add(e.url);
+    const key = `${e.method} ${e.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(e);
-    if (out.length >= MAX_PROBE_TARGETS) break;
+    if (out.length >= maxTargets) break;
   }
   return out;
 }

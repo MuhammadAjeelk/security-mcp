@@ -36855,6 +36855,14 @@ var EnvSchema = external_exports.object({
   SCAN_JS_BUNDLE_MAX: external_exports.coerce.number().int().min(0).default(15),
   /** Max throwaway accounts the self-registration routine may create. */
   SCAN_REGISTER_MAX_ACCOUNTS: external_exports.coerce.number().int().min(0).max(5).default(2),
+  /**
+   * Max distinct endpoints the active-probe library will exercise per scan.
+   * Raise for thorough route-by-route coverage of large APIs (still bounded by
+   * SCAN_MAX_REQUESTS). The old hardcoded value was 10.
+   */
+  SCAN_PROBE_MAX_TARGETS: external_exports.coerce.number().int().min(1).default(40),
+  /** Max endpoints re-probed per role in the multi-role differential. */
+  SCAN_ROLE_PROBE_MAX: external_exports.coerce.number().int().min(1).default(40),
   PROMPT_LOOP_MAX_ITERATIONS: external_exports.coerce.number().int().positive().default(3),
   REPORTS_DIR: external_exports.string().default("./reports"),
   LLM_PROVIDER: external_exports.enum(["mock", "anthropic"]).default("mock"),
@@ -37568,7 +37576,6 @@ function dedupe2(endpoints) {
 }
 
 // src/core/scanner/multi-role-prober.ts
-var MAX_PROBES_PER_ROLE = 15;
 async function probeEndpointsPerRole(input) {
   const results = {};
   if (input.accounts.length === 0) return results;
@@ -37621,11 +37628,12 @@ function selectCandidates(endpoints) {
   );
   const seen = /* @__PURE__ */ new Set();
   const out = [];
+  const max = getEnv().SCAN_ROLE_PROBE_MAX;
   for (const e of [...interesting, ...endpoints]) {
     if (seen.has(e.url)) continue;
     seen.add(e.url);
     out.push(e);
-    if (out.length >= MAX_PROBES_PER_ROLE) break;
+    if (out.length >= max) break;
   }
   return out;
 }
@@ -39440,6 +39448,116 @@ var dependencyRiskPrompt = {
   }
 };
 
+// src/core/prompt-engine/prompts/infrastructure/cloud-storage.prompt.ts
+var STORAGE_PATTERNS = [
+  // Amazon S3 — virtual-hosted, path-style, regional, and s3:// scheme
+  { name: "Amazon S3 bucket URL", re: /\b[a-z0-9.-]+\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com\b/i },
+  { name: "Amazon S3 path-style URL", re: /\bs3(?:[.-][a-z0-9-]+)?\.amazonaws\.com\/[a-z0-9.\-_]+/i },
+  { name: "S3 scheme reference", re: /\bs3:\/\/[a-z0-9.\-_]+/i },
+  // Google Cloud Storage
+  { name: "Google Cloud Storage URL", re: /\b(?:storage\.googleapis\.com|storage\.cloud\.google\.com)\/[a-z0-9.\-_]+/i },
+  { name: "GCS bucket subdomain", re: /\b[a-z0-9.-]+\.storage\.googleapis\.com\b/i },
+  { name: "GCS scheme reference", re: /\bgs:\/\/[a-z0-9.\-_]+/i },
+  // Azure Blob Storage
+  { name: "Azure Blob Storage URL", re: /\b[a-z0-9-]+\.blob\.core\.windows\.net\b/i },
+  // Other S3-compatible providers
+  { name: "DigitalOcean Spaces URL", re: /\b[a-z0-9.-]+\.digitaloceanspaces\.com\b/i },
+  { name: "Cloudflare R2 URL", re: /\b[a-z0-9.-]+\.r2\.cloudflarestorage\.com\b/i },
+  { name: "Backblaze B2 URL", re: /\b[a-z0-9.-]+\.backblazeb2\.com\b/i }
+];
+var PRESIGNED_PATTERNS = [
+  { name: "AWS presigned URL signature", re: /[?&]X-Amz-Signature=/i },
+  { name: "AWS presigned URL credential", re: /[?&]X-Amz-Credential=/i },
+  { name: "GCS signed URL signature", re: /[?&]X-Goog-Signature=/i },
+  { name: "Azure SAS token", re: /[?&]sig=[^&\s]+(?:&|.*?)(?:se|sp|sv)=/i }
+];
+var cloudStoragePrompt = {
+  id: "infrastructure.cloud-storage-exposure",
+  title: "Exposed cloud storage (S3/GCS/Azure Blob) buckets, objects & presigned URLs",
+  category: "infrastructure",
+  severityFocus: "high",
+  prompt: [
+    "Goal: Find data leakage through cloud object storage \u2014 public/listable buckets, world-readable",
+    "objects holding sensitive data, and presigned/SAS URLs that have leaked into client-reachable",
+    "content. This is one of the most common breach vectors for data-heavy apps.",
+    "",
+    "Evidence required: JSON/HTML response bodies, OpenAPI/Swagger spec, JS bundles, redirect",
+    "`Location` headers, CDN/asset config, and any discovered endpoint URLs. Look for storage hosts:",
+    "s3*.amazonaws.com / <bucket>.s3.*.amazonaws.com / s3://, storage.googleapis.com / gs://,",
+    "*.blob.core.windows.net, *.digitaloceanspaces.com, *.r2.cloudflarestorage.com.",
+    "",
+    "Method (NON-DESTRUCTIVE, stay in scope):",
+    "1. Extract every bucket and object URL referenced anywhere in reachable content; record the",
+    "   provider and bucket name.",
+    "2. For presigned/SAS URLs (X-Amz-Signature, X-Goog-Signature, Azure sig=) note the expiry",
+    "   (X-Amz-Expires / se=) \u2014 a long-lived signed URL handed to the client is a credential leak.",
+    "3. Assess public exposure ONLY within the target policy. If the bucket lives on a different host",
+    "   that validate_target would reject, do NOT fetch it \u2014 report the bucket name and recommend the",
+    "   owner verify with an unauthenticated `aws s3 ls s3://<bucket> --no-sign-request` (or provider",
+    "   equivalent). NEVER use leaked credentials and never attempt anonymous writes.",
+    "4. If an object URL is in-scope and returns data without auth, confirm whether it holds PII/PHI",
+    "   or other sensitive data \u2014 that is a confirmed data leak.",
+    "",
+    "Output: critical when a public bucket/object exposes sensitive data or a live write-capable",
+    "credential leaks; high for a leaked presigned URL or a confirmed world-readable private object;",
+    "medium for a disclosed bucket name whose ACL could not be verified in scope. Confidence high only",
+    "on observed evidence (HTTP response, listing XML); medium/low when reasoning from a URL alone."
+  ].join("\n"),
+  heuristic(ctx) {
+    const ev = asScanEvidence(ctx.evidence);
+    if (!ev) return [];
+    const findings = [];
+    const haystacks = [
+      ...ev.endpoints.map((e) => ({ where: e.url, text: e.url })),
+      ...(ev.notes ?? []).map((n, i) => ({ where: `note[${i}]`, text: n }))
+    ];
+    for (const { url, headers } of eachHeaders(ev)) {
+      for (const [name, value] of Object.entries(headers)) {
+        haystacks.push({ where: `${url} [header:${name}]`, text: value });
+      }
+    }
+    const seen = /* @__PURE__ */ new Set();
+    for (const { where, text } of haystacks) {
+      for (const pat of PRESIGNED_PATTERNS) {
+        if (pat.re.test(text)) {
+          const key = `presigned:${where}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          findings.push({
+            title: `Leaked presigned/SAS storage URL: ${pat.name}`,
+            severity: "high",
+            category: "infrastructure",
+            description: `A ${pat.name} is reachable at ${where}. A signed URL is a time-limited credential to a private object; if it leaks to the client or logs it grants direct object access until it expires.`,
+            evidence: { where, pattern: pat.name },
+            impact: "Anyone with the leaked signed URL can read (and sometimes write) the private object until expiry \u2014 a direct data-exposure path that bypasses application auth.",
+            remediation: "Keep presigned URLs short-lived, never log them, generate them per-request server-side, and prefer short TTLs. Revoke/rotate the underlying keys if a long-lived URL leaked.",
+            confidence: "medium"
+          });
+        }
+      }
+      for (const pat of STORAGE_PATTERNS) {
+        const m = text.match(pat.re);
+        if (m) {
+          const key = `store:${pat.name}:${m[0].toLowerCase()}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          findings.push({
+            title: `Cloud storage reference disclosed: ${pat.name}`,
+            severity: "medium",
+            category: "infrastructure",
+            description: `A cloud object-storage reference (${m[0]}) is exposed in client-reachable content at ${where}. Verify whether the bucket is publicly listable or the object is world-readable.`,
+            evidence: { where, match: m[0], provider: pat.name },
+            impact: "Disclosed bucket names let an attacker probe for public-list/public-read misconfigurations; a permissive ACL would expose stored data directly.",
+            remediation: "Confirm the bucket blocks public access (S3 Block Public Access / uniform bucket-level access), serve user content via authenticated, short-lived signed URLs, and avoid embedding raw bucket URLs in client responses.",
+            confidence: "low"
+          });
+        }
+      }
+    }
+    return findings;
+  }
+};
+
 // src/core/prompt-engine/prompts/multi-tenant/tenant-isolation.prompt.ts
 var tenantIsolationPrompt = {
   id: "multi-tenant.isolation",
@@ -39550,6 +39668,7 @@ var PROMPT_REGISTRY = Object.freeze([
   secretScanningPrompt,
   // infrastructure
   dependencyRiskPrompt,
+  cloudStoragePrompt,
   // multi-tenant
   tenantIsolationPrompt
 ]);
@@ -40050,11 +40169,10 @@ var PROBE_LIBRARY = Object.freeze([
 ]);
 
 // src/core/scanner/probe-runner.ts
-var MAX_PROBE_TARGETS = 10;
 var MAX_PROBES_PER_TARGET = 4;
 async function runActiveProbes(input) {
   const env = getEnv();
-  const targets = pickProbeTargets(input.endpoints);
+  const targets = pickProbeTargets(input.endpoints, env.SCAN_PROBE_MAX_TARGETS);
   if (targets.length === 0) return [];
   input.audit.event("probes.start", { targets: targets.length, probes: PROBE_LIBRARY.length });
   const findings = [];
@@ -40084,17 +40202,18 @@ async function runActiveProbes(input) {
   input.audit.event("probes.done", { findings: findings.length });
   return findings;
 }
-function pickProbeTargets(endpoints) {
+function pickProbeTargets(endpoints, maxTargets) {
   const candidates = endpoints.filter(
-    (e) => /[?&]/.test(e.url) || /\/(api|search|filter|q|id)\b/i.test(e.url)
+    (e) => /[?&]/.test(e.url) || /\/(api|search|filter|q|id|graphql|rest)\b/i.test(e.url) || e.method !== "GET"
   );
   const seen = /* @__PURE__ */ new Set();
   const out = [];
   for (const e of [...candidates, ...endpoints]) {
-    if (seen.has(e.url)) continue;
-    seen.add(e.url);
+    const key = `${e.method} ${e.url}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     out.push(e);
-    if (out.length >= MAX_PROBE_TARGETS) break;
+    if (out.length >= maxTargets) break;
   }
   return out;
 }

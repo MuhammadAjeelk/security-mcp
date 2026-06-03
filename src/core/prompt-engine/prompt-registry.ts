@@ -51,6 +51,7 @@ import { clickjackingPrompt } from './prompts/config/clickjacking.prompt.js';
 import { secretScanningPrompt } from './prompts/config/secret-scanning.prompt.js';
 
 import { dependencyRiskPrompt } from './prompts/infrastructure/dependency-risk.prompt.js';
+import { cloudStoragePrompt } from './prompts/infrastructure/cloud-storage.prompt.js';
 import { tenantIsolationPrompt } from './prompts/multi-tenant/tenant-isolation.prompt.js';
 
 export const PROMPT_REGISTRY: readonly SecurityPrompt[] = Object.freeze([
@@ -106,6 +107,7 @@ export const PROMPT_REGISTRY: readonly SecurityPrompt[] = Object.freeze([
   secretScanningPrompt,
   // infrastructure
   dependencyRiskPrompt,
+  cloudStoragePrompt,
   // multi-tenant
   tenantIsolationPrompt,
 ]);

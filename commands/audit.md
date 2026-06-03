@@ -47,8 +47,13 @@ If **no `--account` flags were given** (empty `testAccounts`), do not give up on
 5. Record what you did on the ledger. If self-registration is closed (no public signup, email verification required, etc.), note that and mark the auth-dependent goals `not-applicable` with the reason — do not fabricate a session.
 
 ### Step 2 — Autonomous probing loop (repeat until done, max `maxIterations`)
+
+> **Cover EVERY route, not a sample.** Iterate the full endpoint list from `evidence.attackSurface.endpoints` (including every operation parsed from the OpenAPI/Swagger spec) route-by-route — do not stop after the first handful. For each route, exercise every applicable goal and every HTTP method the spec declares, building request bodies from `evidence.apiPayloadHints` (or the spec's DTO schema) so POST/PUT/PATCH routes are actually hit, not just GETs. The deterministic active-probe pass now covers up to `SCAN_PROBE_MAX_TARGETS` (default 40) routes; if the API is larger, raise that env / `SCAN_MAX_REQUESTS` or loop `security_scan` over narrower path prefixes until every route has been touched. Track per-route progress so you can prove total coverage.
+>
+> **The hard limit is auth, not effort.** A route behind a login returns 401/403 to every unauthenticated probe — you cannot find its IDOR/BOLA/mass-assignment/injection bugs without a valid credential. If most of the surface is auth-gated and no `--account` token was supplied (and self-registration is closed, e.g. Clerk/Auth0-hosted), say so plainly and mark those goals `partial` with the reason "no credential" — never report them `clean`. The single biggest coverage unlock is the operator supplying one admin + one normal token; request it explicitly.
+
 Each iteration, do ONE focused, productive thing:
-1. Read the coverage ledger. Pick the **highest-risk uncovered** work: prioritise goals on `auth-gated`, `path-id`, `upload`, and `admin` endpoints first (that's where breaches come from), then the rest.
+1. Read the coverage ledger. Pick the **highest-risk uncovered** work: prioritise goals on `auth-gated`, `path-id`, `upload`, and `admin` endpoints first (that's where breaches come from), then the rest. Within a goal, sweep across **all** applicable routes before calling it covered.
 2. Fetch the relevant prompt(s) via `list_security_prompts` (filter by `category` or `ids` to stay focused).
 3. Apply each prompt against the evidence. Where the prompt needs more signal, you MAY:
    - re-run `security_scan` with `testAccounts` (authenticated differential), a higher `maxDepth`, or a narrower target, OR

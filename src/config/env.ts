@@ -23,6 +23,14 @@ const EnvSchema = z.object({
   SCAN_JS_BUNDLE_MAX: z.coerce.number().int().min(0).default(15),
   /** Max throwaway accounts the self-registration routine may create. */
   SCAN_REGISTER_MAX_ACCOUNTS: z.coerce.number().int().min(0).max(5).default(2),
+  /**
+   * Max distinct endpoints the active-probe library will exercise per scan.
+   * Raise for thorough route-by-route coverage of large APIs (still bounded by
+   * SCAN_MAX_REQUESTS). The old hardcoded value was 10.
+   */
+  SCAN_PROBE_MAX_TARGETS: z.coerce.number().int().min(1).default(40),
+  /** Max endpoints re-probed per role in the multi-role differential. */
+  SCAN_ROLE_PROBE_MAX: z.coerce.number().int().min(1).default(40),
   PROMPT_LOOP_MAX_ITERATIONS: z.coerce.number().int().positive().default(3),
   REPORTS_DIR: z.string().default('./reports'),
   LLM_PROVIDER: z.enum(['mock', 'anthropic']).default('mock'),

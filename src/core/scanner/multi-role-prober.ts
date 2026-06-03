@@ -4,9 +4,8 @@ import type {
   RoleProbeResult,
   TestAccount,
 } from '../../types/scan.types.js';
+import { getEnv } from '../../config/env.js';
 import { AuditLogger } from '../logging/audit-logger.js';
-
-const MAX_PROBES_PER_ROLE = 15;
 
 /**
  * Re-fetch a curated subset of discovered endpoints once per test account so
@@ -74,11 +73,12 @@ function selectCandidates(endpoints: DiscoveredEndpoint[]): DiscoveredEndpoint[]
   );
   const seen = new Set<string>();
   const out: DiscoveredEndpoint[] = [];
+  const max = getEnv().SCAN_ROLE_PROBE_MAX;
   for (const e of [...interesting, ...endpoints]) {
     if (seen.has(e.url)) continue;
     seen.add(e.url);
     out.push(e);
-    if (out.length >= MAX_PROBES_PER_ROLE) break;
+    if (out.length >= max) break;
   }
   return out;
 }
