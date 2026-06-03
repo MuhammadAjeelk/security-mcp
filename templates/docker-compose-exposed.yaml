@@ -1,0 +1,24 @@
+id: docker-compose-exposed
+info:
+  name: Exposed docker-compose / Dockerfile
+  severity: medium
+  description: >-
+    A publicly reachable docker-compose.yml or Dockerfile leaks service
+    topology, image versions, and frequently hardcoded credentials/env vars.
+  tags: [exposure, configuration, secrets]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /docker-compose.yml
+      - /docker-compose.yaml
+      - /Dockerfile
+      - /.dockerignore
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^(version:|services:|FROM\s+\S+|ENV\s+\S+)'

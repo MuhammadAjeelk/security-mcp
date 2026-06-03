@@ -15,8 +15,14 @@ const EnvSchema = z.object({
     .optional()
     .transform((v) => csv(v)),
   SCAN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
-  SCAN_MAX_REQUESTS: z.coerce.number().int().positive().default(50),
+  SCAN_MAX_REQUESTS: z.coerce.number().int().positive().default(150),
   SCAN_MAX_DEPTH: z.coerce.number().int().min(0).max(10).default(2),
+  /** Max wordlist candidates content-discovery may request per scan. */
+  SCAN_WORDLIST_MAX: z.coerce.number().int().min(0).default(60),
+  /** Max .js bundles the endpoint extractor will download per scan. */
+  SCAN_JS_BUNDLE_MAX: z.coerce.number().int().min(0).default(15),
+  /** Max throwaway accounts the self-registration routine may create. */
+  SCAN_REGISTER_MAX_ACCOUNTS: z.coerce.number().int().min(0).max(5).default(2),
   PROMPT_LOOP_MAX_ITERATIONS: z.coerce.number().int().positive().default(3),
   REPORTS_DIR: z.string().default('./reports'),
   LLM_PROVIDER: z.enum(['mock', 'anthropic']).default('mock'),

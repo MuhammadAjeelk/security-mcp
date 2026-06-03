@@ -1,0 +1,27 @@
+id: ci-config-exposed
+info:
+  name: Exposed CI/CD configuration
+  severity: medium
+  description: >-
+    CI config files (GitLab, CircleCI, Travis, GitHub Actions, Jenkinsfile)
+    expose build pipelines and frequently contain deploy tokens/secrets.
+  tags: [exposure, configuration, ci]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /.gitlab-ci.yml
+      - /.circleci/config.yml
+      - /.travis.yml
+      - /.github/workflows/main.yml
+      - /.github/workflows/ci.yml
+      - /Jenkinsfile
+      - /bitbucket-pipelines.yml
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '(?m)^(stages:|jobs:|pipeline\b|script:|steps:|version:\s*2|language:)'

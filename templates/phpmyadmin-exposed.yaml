@@ -1,0 +1,29 @@
+id: phpmyadmin-exposed
+info:
+  name: Exposed phpMyAdmin / Adminer database console
+  severity: high
+  description: >-
+    A reachable phpMyAdmin or Adminer login is a high-value target for
+    brute-force and known-CVE exploitation against the database.
+  tags: [exposure, panel, database]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /phpmyadmin/
+      - /pma/
+      - /phpMyAdmin/
+      - /adminer.php
+      - /adminer/
+      - /dbadmin/
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200, 401]
+      - type: word
+        part: body
+        words:
+          - "phpMyAdmin"
+          - "Adminer"
+          - "pma_username"
+        condition: or

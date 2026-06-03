@@ -1,0 +1,107 @@
+# High-signal paths/files for content discovery. One path per line; blank lines
+# and lines starting with '#' are ignored. Kept deliberately small and curated
+# (not a megalist) so a scan stays well within the request budget. Every entry
+# is a safe GET. Ordered roughly by signal value.
+
+# --- Admin / management surfaces ---
+/admin
+/admin/
+/administrator
+/admin/login
+/admin.php
+/wp-admin/
+/dashboard
+/manage
+/management
+/console
+/internal
+/debug
+/status
+/health
+/healthz
+/metrics
+/actuator
+/actuator/health
+/actuator/env
+
+# --- Source control / build leakage ---
+/.git/HEAD
+/.git/config
+/.gitignore
+/.svn/entries
+/.hg/
+/.bzr/
+
+# --- Config & secret files ---
+/.env
+/.env.local
+/.env.development
+/.env.production
+/config.json
+/config.yml
+/config.yaml
+/settings.py
+/appsettings.json
+/web.config
+/wp-config.php.bak
+/.npmrc
+/.netrc
+/.dockerenv
+/docker-compose.yml
+/docker-compose.yaml
+/Dockerfile
+/.DS_Store
+
+# --- Backups / archives (commonly left behind) ---
+/backup
+/backup.zip
+/backup.sql
+/backup.tar.gz
+/db.sql
+/dump.sql
+/database.sql
+/site.zip
+/www.zip
+/app.zip
+
+# --- API surfaces ---
+/api
+/api/
+/api/v1
+/api/v2
+/api/users
+/api/admin
+/api/health
+/api/status
+/api/config
+/graphql
+/graphiql
+/rest
+/v1
+/v2
+
+# --- Auth surfaces ---
+/login
+/signup
+/register
+/signin
+/logout
+/auth
+/oauth/authorize
+/.well-known/security.txt
+/.well-known/openid-configuration
+
+# --- Misc info disclosure ---
+/server-status
+/server-info
+/phpinfo.php
+/info.php
+/test.php
+/robots.txt
+/sitemap.xml
+/crossdomain.xml
+/package.json
+/composer.json
+/yarn.lock
+/README.md
+/CHANGELOG.md

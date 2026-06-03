@@ -20,25 +20,53 @@ export interface ProbeDetection {
   evidence: Record<string, unknown>;
 }
 
+export type ProbeCategory =
+  | 'sql-injection'
+  | 'xss-reflected'
+  | 'open-redirect'
+  | 'crlf-injection'
+  | 'header-injection'
+  | 'path-traversal'
+  | 'ssrf-marker'
+  | 'command-injection'
+  | 'time-based-blind'
+  | 'ssti'
+  | 'xxe'
+  | 'graphql-introspection'
+  | 'nosql-operator'
+  | 'cors-misconfig'
+  | 'host-header-injection';
+
+/** How the probe runner should deliver this probe. */
+export interface ProbeRequestSpec {
+  method: string;
+  contentType?: string;
+  /** Raw request body (for POST/PUT body probes). */
+  body?: string;
+}
+
 export interface ProbeDefinition {
   id: string;
   /** Vulnerability class this probe is testing for. */
-  category:
-    | 'sql-injection'
-    | 'xss-reflected'
-    | 'open-redirect'
-    | 'crlf-injection'
-    | 'header-injection'
-    | 'path-traversal'
-    | 'ssrf-marker'
-    | 'command-injection'
-    | 'time-based-blind';
+  category: ProbeCategory;
   description: string;
   payload: ProbePayload;
   /** Severity to emit when the probe is confirmed (not exploited). */
   severityOnConfirm: Severity;
   /** Confidence to report on confirmation. */
   confidenceOnConfirm: Confidence;
+  /**
+   * Delivery mode. 'query' (default) injects payload.value into a query param.
+   * 'header' sets payload.headerName/headerValue. 'body' sends `request`.
+   */
+  mode?: 'query' | 'header' | 'body';
+  /** For mode 'body': the request to send (method/content-type/body). */
+  request?: ProbeRequestSpec;
+  /**
+   * Restrict this probe to endpoint URLs matching this pattern (e.g. only run
+   * GraphQL introspection against /graphql). Omit to apply broadly.
+   */
+  appliesTo?: RegExp;
   /**
    * Inspect the response and decide whether the probe was confirmed.
    *
@@ -170,10 +198,18 @@ export const PROBE_LIBRARY: readonly ProbeDefinition[] = Object.freeze([
     severityOnConfirm: 'high',
     confidenceOnConfirm: 'low',
     detect: (r) => {
-      if (/smcp-ssrf-canary\.invalid|getaddrinfo/i.test(r.body)) {
+      // A DNS/connection error naming the canary means the server actually
+      // tried to FETCH it — that is the SSRF signal. Mere reflection of the
+      // canary (apps that echo the request URL in a 404/400 body) is NOT SSRF,
+      // so we require a fetch-failure signature, not bare reflection.
+      const fetchError =
+        /(getaddrinfo|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|dns lookup|failed to fetch|fetch failed|request to .*smcp-ssrf-canary|unable to (resolve|connect))/i;
+      const canaryNearError =
+        /smcp-ssrf-canary\.invalid/.test(r.body) && fetchError.test(r.body);
+      if (canaryNearError || /getaddrinfo|EAI_AGAIN|ENOTFOUND/i.test(r.body)) {
         return {
           triggered: true,
-          evidence: { hint: 'canary host name reflected in response — likely SSRF attempt visible' },
+          evidence: { hint: 'server attempted to resolve/fetch the canary host (SSRF)' },
         };
       }
       return { triggered: false, evidence: {} };
@@ -192,6 +228,153 @@ export const PROBE_LIBRARY: readonly ProbeDefinition[] = Object.freeze([
           triggered: true,
           evidence: { hint: 'shell-related error visible in response body' },
         };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'ssti.arithmetic-marker',
+    category: 'ssti',
+    description:
+      'Server-side template injection canary. Sends a guarded arithmetic expression in common ' +
+      'template syntaxes; if the server renders the math (49), a template engine is evaluating input.',
+    payload: { value: 'smcp{{7*7}}${7*7}#{7*7}<%=7*7%>' },
+    severityOnConfirm: 'critical',
+    confidenceOnConfirm: 'medium',
+    detect: (r) => {
+      // The literal payload must NOT remain verbatim; the evaluated form (smcp49) is the tell.
+      if (/smcp49\b/.test(r.body) && !/smcp\{\{7\*7\}\}/.test(r.body)) {
+        return { triggered: true, evidence: { hint: 'template expression evaluated (7*7 → 49)' } };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'host-header.injection',
+    category: 'host-header-injection',
+    description:
+      'Sets a spoofed X-Forwarded-Host. If the value is reflected into links, redirects, or the ' +
+      'body, the app trusts attacker-controlled host headers (password-reset poisoning, cache issues).',
+    mode: 'header',
+    payload: { value: '', headerName: 'x-forwarded-host', headerValue: 'smcp-evil.invalid' },
+    severityOnConfirm: 'medium',
+    confidenceOnConfirm: 'medium',
+    detect: (r) => {
+      const loc = r.headers['location'] ?? '';
+      if (/smcp-evil\.invalid/.test(loc) || /smcp-evil\.invalid/.test(r.body)) {
+        return {
+          triggered: true,
+          evidence: { hint: 'spoofed X-Forwarded-Host reflected', location: loc || undefined },
+        };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'cors.origin-reflection',
+    category: 'cors-misconfig',
+    description:
+      'Sends a foreign Origin and checks whether the server reflects it in ' +
+      'Access-Control-Allow-Origin while allowing credentials — a cross-origin data-theft misconfig.',
+    mode: 'header',
+    payload: { value: '', headerName: 'origin', headerValue: 'https://smcp-evil.invalid' },
+    severityOnConfirm: 'high',
+    confidenceOnConfirm: 'high',
+    detect: (r) => {
+      const acao = r.headers['access-control-allow-origin'] ?? '';
+      const acac = r.headers['access-control-allow-credentials'] ?? '';
+      const reflected = acao === 'https://smcp-evil.invalid';
+      const wildcardCreds = acao === '*' && /true/i.test(acac);
+      if ((reflected && /true/i.test(acac)) || reflected || wildcardCreds) {
+        return {
+          triggered: true,
+          evidence: {
+            'access-control-allow-origin': acao,
+            'access-control-allow-credentials': acac || undefined,
+            hint: wildcardCreds
+              ? 'wildcard ACAO with credentials'
+              : 'foreign Origin reflected in ACAO',
+          },
+        };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'graphql.introspection-enabled',
+    category: 'graphql-introspection',
+    description:
+      'Sends a minimal introspection query to a GraphQL endpoint. A populated __schema means ' +
+      'introspection is enabled in production — it hands an attacker the full API map.',
+    mode: 'body',
+    appliesTo: /graphql/i,
+    payload: { value: '' },
+    request: {
+      method: 'POST',
+      contentType: 'application/json',
+      body: JSON.stringify({ query: '{__schema{queryType{name} types{name}}}' }),
+    },
+    severityOnConfirm: 'medium',
+    confidenceOnConfirm: 'high',
+    detect: (r) => {
+      if (/"__schema"\s*:/.test(r.body) && /"types"\s*:/.test(r.body)) {
+        return { triggered: true, evidence: { hint: 'GraphQL introspection returned a schema' } };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'nosql.operator-injection',
+    category: 'nosql-operator',
+    description:
+      'Sends a JSON body using a Mongo-style operator object ({"$gt":""}) in place of a string. ' +
+      'A different response vs a normal value suggests the operator reached the database layer.',
+    mode: 'body',
+    appliesTo: /login|auth|search|user|query|find/i,
+    payload: { value: '' },
+    request: {
+      method: 'POST',
+      contentType: 'application/json',
+      body: JSON.stringify({ username: { $gt: '' }, password: { $gt: '' } }),
+    },
+    severityOnConfirm: 'high',
+    confidenceOnConfirm: 'low',
+    detect: (r) => {
+      // Auth bypass tell: operator object accepted (2xx) where a string login would 401,
+      // or a Mongo/cast error surfaced.
+      if (/CastError|MongoError|\$gt|BSON|cannot be cast/i.test(r.body)) {
+        return { triggered: true, evidence: { hint: 'NoSQL operator reached the data layer (error)' } };
+      }
+      if (r.status >= 200 && r.status < 300 && /token|session|"id"|success/i.test(r.body)) {
+        return {
+          triggered: true,
+          evidence: { hint: 'operator-object body accepted with a success-shaped response — verify auth bypass' },
+        };
+      }
+      return { triggered: false, evidence: {} };
+    },
+  },
+  {
+    id: 'xxe.entity-canary',
+    category: 'xxe',
+    description:
+      'Posts an XML document declaring a benign internal entity (no external/SYSTEM fetch). If the ' +
+      'entity is expanded in the response, the parser resolves entities and is likely XXE-prone.',
+    mode: 'body',
+    appliesTo: /xml|soap|upload|import|feed/i,
+    payload: { value: '' },
+    request: {
+      method: 'POST',
+      contentType: 'application/xml',
+      body:
+        '<?xml version="1.0"?><!DOCTYPE smcp [<!ENTITY smcpx "SMCP_XXE_CANARY">]>' +
+        '<smcp><v>&smcpx;</v></smcp>',
+    },
+    severityOnConfirm: 'high',
+    confidenceOnConfirm: 'low',
+    detect: (r) => {
+      if (/SMCP_XXE_CANARY/.test(r.body)) {
+        return { triggered: true, evidence: { hint: 'internal XML entity was expanded in the response' } };
       }
       return { triggered: false, evidence: {} };
     },

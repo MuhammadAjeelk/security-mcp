@@ -10,12 +10,19 @@ requests:
     paths:
       - /
       - /_ignition/health-check
-    matchersCondition: or
+      - /_ignition/execute-solution
+    # Require a 200 AND a distinctive Ignition marker. Without the status guard,
+    # apps that echo the requested path in their 404 body (e.g. NestJS:
+    # "Cannot GET /_ignition/...") falsely match the bare "_ignition" word.
+    matchersCondition: and
     matchers:
+      - type: status
+        status: [200]
       - type: word
         part: body
         words:
           - 'Whoops'
-          - 'Ignition'
-          - '_ignition'
+          - 'ignition.styles'
+          - 'solutionProviders'
+          - 'report_id'
         condition: or
