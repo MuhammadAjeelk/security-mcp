@@ -33,6 +33,15 @@ export const WELL_KNOWN_PATHS: readonly string[] = Object.freeze([
   '/v3/api-docs',
   '/docs/swagger.json',
   '/.well-known/openapi.json',
+  // NestJS (SwaggerModule) serves the machine-readable spec next to the UI,
+  // commonly at <docsPath>-json / -yaml. Frameworks rarely advertise these.
+  '/api/docs-json',
+  '/api/docs-yaml',
+  '/api-json',
+  '/api-yaml',
+  '/docs-json',
+  '/swagger-json',
+  '/swagger/json',
 ]);
 
 const SPEC_CONTENT_RE = /("openapi"|"swagger"|"paths"\s*:|openapi:|swagger:)/i;

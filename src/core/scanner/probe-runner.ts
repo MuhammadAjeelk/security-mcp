@@ -2,6 +2,7 @@ import { request } from 'undici';
 import { validateTarget } from '../policy/target-policy.js';
 import { getEnv } from '../../config/env.js';
 import { AuditLogger } from '../logging/audit-logger.js';
+import { sendRequest } from './http-request.js';
 import { PROBE_LIBRARY, type ProbeDefinition, type ProbeOutcome } from './probe-library.js';
 import type { Finding } from '../../types/finding.types.js';
 import type { DiscoveredEndpoint, TestAccount } from '../../types/scan.types.js';
@@ -74,15 +75,23 @@ function pickProbeTargets(endpoints: DiscoveredEndpoint[]): DiscoveredEndpoint[]
 function pickProbesForEndpoint(endpoint: DiscoveredEndpoint): ProbeDefinition[] {
   const hasQuery = /[?&]/.test(endpoint.url);
   const probes = PROBE_LIBRARY.filter((p) => {
+    // Per-probe URL restriction (e.g. GraphQL introspection only on /graphql).
+    if (p.appliesTo && !p.appliesTo.test(endpoint.url)) return false;
     if (p.category === 'open-redirect' && !/\b(redirect|next|return_to|url|target)\b/i.test(endpoint.url)) {
       return false;
     }
-    if (!hasQuery && (p.category === 'sql-injection' || p.category === 'xss-reflected')) {
+    // Query-injection probes need a query string to inject into.
+    const isQueryMode = (p.mode ?? 'query') === 'query';
+    if (isQueryMode && !hasQuery && (p.category === 'sql-injection' || p.category === 'xss-reflected' || p.category === 'ssti')) {
       return false;
     }
     return true;
   });
-  return probes.slice(0, MAX_PROBES_PER_TARGET);
+  // Body/header probes are valuable and few — don't let the per-target cap starve
+  // them behind the many query probes. Keep all non-query-mode probes, cap the rest.
+  const special = probes.filter((p) => (p.mode ?? 'query') !== 'query');
+  const queryProbes = probes.filter((p) => (p.mode ?? 'query') === 'query').slice(0, MAX_PROBES_PER_TARGET);
+  return [...queryProbes, ...special];
 }
 
 async function issueProbe(
@@ -91,6 +100,26 @@ async function issueProbe(
   account: TestAccount | undefined,
   timeoutMs: number,
 ): Promise<ProbeOutcome> {
+  // Body-mode probes (GraphQL/NoSQL/XXE) send a crafted request body via the
+  // shared policy-checked sender instead of GET-with-query-injection.
+  if (probe.mode === 'body' && probe.request) {
+    const start = Date.now();
+    const res = await sendRequest({
+      url,
+      method: probe.request.method,
+      headers: probe.request.contentType ? { 'content-type': probe.request.contentType } : undefined,
+      body: probe.request.body,
+      account,
+      timeoutMs,
+    });
+    return {
+      status: res.status,
+      headers: res.headers,
+      body: res.body.slice(0, 64 * 1024),
+      durationMs: res.durationMs || Date.now() - start,
+    };
+  }
+
   const target = injectPayload(url, probe);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -187,6 +216,20 @@ function severityImpact(probe: ProbeDefinition): string {
       return 'Pivot into internal services / cloud metadata.';
     case 'time-based-blind':
       return 'Latency anomaly — investigate for blind injection.';
+    case 'ssti':
+      return 'Server-side template injection → remote code execution.';
+    case 'xxe':
+      return 'XML external entity processing → file read / SSRF / DoS.';
+    case 'graphql-introspection':
+      return 'Full API schema disclosure aids targeted attacks.';
+    case 'nosql-operator':
+      return 'Authentication bypass / data exfiltration via operator injection.';
+    case 'cors-misconfig':
+      return 'Cross-origin theft of authenticated responses.';
+    case 'host-header-injection':
+      return 'Password-reset poisoning, cache poisoning, routing abuse.';
+    default:
+      return 'Confirmed probe signal — verify and remediate.';
   }
 }
 

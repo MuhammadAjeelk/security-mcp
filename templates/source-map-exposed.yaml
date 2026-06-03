@@ -1,0 +1,28 @@
+id: source-map-exposed
+info:
+  name: Exposed JavaScript source map
+  severity: low
+  description: >-
+    Publicly reachable .map files reconstruct original (pre-minified) source,
+    often revealing internal logic, comments, API routes, and secrets.
+  tags: [exposure, source-disclosure]
+confidence: medium
+requests:
+  - method: GET
+    paths:
+      - /static/js/main.js.map
+      - /assets/index.js.map
+      - /bundle.js.map
+      - /app.js.map
+      - /main.js.map
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - '"version":'
+          - '"sources":'
+          - '"mappings":'
+        condition: and

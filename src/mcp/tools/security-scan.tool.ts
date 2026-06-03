@@ -4,6 +4,9 @@ import { crawlTarget } from '../../core/scanner/crawler.js';
 import { runBrowserChecks } from '../../core/scanner/browser-scanner.js';
 import { buildAttackSurface } from '../../core/scanner/attack-surface.js';
 import { runActiveProbes } from '../../core/scanner/probe-runner.js';
+import { autoRegister } from '../../core/scanner/auto-register.js';
+import { findApiPayload } from '../../core/scanner/api-payload-finder.js';
+import { probeAccessControl } from '../../core/scanner/access-control-prober.js';
 import { runTemplates } from '../../core/templates/template-runner.js';
 import { loadBundledTemplates } from '../../core/templates/template-loader.js';
 import { AuditLogger } from '../../core/logging/audit-logger.js';
@@ -33,6 +36,8 @@ export const securityScanInputSchema = z.object({
   includeBrowserTests: z.boolean().optional(),
   includeActiveProbes: z.boolean().optional(),
   includeTemplates: z.boolean().optional(),
+  includeContentDiscovery: z.boolean().optional(),
+  registerAccounts: z.boolean().optional(),
   includeServerSidePromptLoop: z.boolean().optional(),
   session: AuthSessionSchema.optional(),
   allowedHosts: z.array(z.string()).optional(),
@@ -61,6 +66,16 @@ export const securityScanToolDefinition = {
       includeTemplates: {
         type: 'boolean',
         description: 'Run the bundled Nuclei-style YAML templates against the target.',
+      },
+      includeContentDiscovery: {
+        type: 'boolean',
+        description:
+          'Brute-force a curated wordlist of high-signal paths/files (admin panels, backups, configs). Default on for deep scans.',
+      },
+      registerAccounts: {
+        type: 'boolean',
+        description:
+          'Self-register throwaway accounts via the public signup flow and probe for mass-assignment privilege escalation. Own-account only, non-destructive.',
       },
       includeServerSidePromptLoop: {
         type: 'boolean',
@@ -126,6 +141,97 @@ export async function handleSecurityScan(input: SecurityScanInput) {
   });
 
   const extraFindings: Finding[] = [];
+
+  // Self-registration + self-healing identity + mass-assignment escalation probe.
+  if (input.registerAccounts) {
+    const reg = await autoRegister({
+      evidence,
+      extraAllowedHosts: input.allowedHosts,
+      audit,
+    });
+    evidence.autoRegister = reg;
+    if (reg.privilegeEscalation) {
+      extraFindings.push({
+        id: `auto-register.privilege-escalation`,
+        title: 'Mass-assignment privilege escalation at signup',
+        severity: 'critical',
+        category: 'access-control',
+        description:
+          `The public registration endpoint (${reg.signupUrl}) honored the privilege-bearing ` +
+          `field "${reg.privilegeEscalation.field}=${reg.privilegeEscalation.value}" that the ` +
+          `signup form never advertised. An unauthenticated attacker can mint an admin account.`,
+        evidence: { signupUrl: reg.signupUrl, ...reg.privilegeEscalation },
+        impact: 'Unauthenticated full-admin account creation → complete application compromise.',
+        remediation:
+          'Allowlist the fields accepted at registration server-side. Never bind request bodies ' +
+          'directly to privileged user attributes (role, is_admin, permissions).',
+        confidence: 'high',
+        promptId: 'access-control.role-escalation',
+        attackChain:
+          'Anonymous attacker POSTs role=admin to /register → server mass-assigns it → ' +
+          'attacker logs in as admin → full data access and account takeover.',
+      });
+    }
+    audit.event('auto-register.done', {
+      signupFound: reg.signupFound,
+      accounts: reg.accounts.length,
+      escalation: !!reg.privilegeEscalation,
+    });
+  }
+
+  // API payload discovery — infer the request shape of bodied API endpoints so
+  // downstream checks can actually exercise them. Capped to a small subset.
+  if (input.registerAccounts || input.includeActiveProbes) {
+    const apiTargets = (evidence.attackSurface?.endpoints ?? [])
+      .filter((e) => e.isApiLike && /^(POST|PUT|PATCH)$/i.test(e.method))
+      .slice(0, 5);
+    if (apiTargets.length > 0) {
+      const hints = [];
+      for (const t of apiTargets) {
+        try {
+          const found = await findApiPayload({
+            url: t.url,
+            method: t.method,
+            session: input.session,
+            account: input.testAccounts?.[0],
+            extraAllowedHosts: input.allowedHosts,
+            audit,
+          });
+          hints.push({
+            url: found.url,
+            method: found.method,
+            encoding: found.encoding,
+            requiredFields: found.requiredFields,
+            inferredPayload: found.inferredPayload,
+            finalStatus: found.finalStatus,
+            succeeded: found.succeeded,
+          });
+        } catch (err) {
+          audit.event('payload-finder.error', {
+            url: t.url,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      if (hints.length > 0) evidence.apiPayloadHints = hints;
+    }
+  }
+
+  // BFLA / access-control prober — replays attacker auth-bypass techniques
+  // (unauthenticated access, header tricks, cross-role differential) against
+  // admin/auth-gated routes, READ-ONLY.
+  if (input.registerAccounts || input.includeActiveProbes) {
+    const surfaceEndpoints = evidence.attackSurface?.endpoints ?? [];
+    if (surfaceEndpoints.some((e) => e.looksAdmin || e.authGated)) {
+      const bflaFindings = await probeAccessControl({
+        endpoints: surfaceEndpoints,
+        accounts: input.testAccounts,
+        extraAllowedHosts: input.allowedHosts,
+        audit,
+      });
+      extraFindings.push(...bflaFindings);
+    }
+  }
 
   if (input.includeActiveProbes) {
     const probeFindings = await runActiveProbes({

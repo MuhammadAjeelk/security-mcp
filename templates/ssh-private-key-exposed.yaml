@@ -1,0 +1,26 @@
+id: ssh-private-key-exposed
+info:
+  name: Exposed SSH/private key file
+  severity: critical
+  description: >-
+    A reachable id_rsa / private key PEM grants direct credential compromise.
+  tags: [exposure, secrets, ssh]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /id_rsa
+      - /.ssh/id_rsa
+      - /id_dsa
+      - /id_ecdsa
+      - /id_ed25519
+      - /private.key
+      - /server.key
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'

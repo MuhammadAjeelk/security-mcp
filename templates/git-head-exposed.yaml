@@ -1,0 +1,25 @@
+id: git-head-exposed
+info:
+  name: Exposed .git/HEAD (source code disclosure)
+  severity: high
+  description: >-
+    A reachable /.git/HEAD indicates the .git directory is web-served, allowing
+    full source code (and often secrets/history) reconstruction.
+  tags: [exposure, git, source-disclosure]
+  reference:
+    - https://owasp.org/www-community/attacks/Source_code_disclosure
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /.git/HEAD
+      - /.git/logs/HEAD
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '^ref:\s+refs/'
+          - '^[0-9a-f]{40}'

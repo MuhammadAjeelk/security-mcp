@@ -33,8 +33,17 @@ export function buildAttackSurface(evidence: ScanEvidence): AttackSurface {
     const isUpload = !!form && formLooksLikeUpload(form);
     const looksAdmin = pathLooksAdmin(e.url);
     const authGated = authGatedUrls.has(normalizeUrl(e.url));
+    const isApiLike = endpointLooksApi(e.url, e.method);
 
-    const flags = { hasQueryParams, hasPathId, authGated, hasForm, isUpload, looksAdmin };
+    const flags = {
+      hasQueryParams,
+      hasPathId,
+      authGated,
+      hasForm,
+      isUpload,
+      looksAdmin,
+      isApiLike,
+    };
     return {
       url: e.url,
       method: e.method,
@@ -51,6 +60,7 @@ export function buildAttackSurface(evidence: ScanEvidence): AttackSurface {
     authGated: endpoints.filter((e) => e.authGated).length,
     uploads: endpoints.filter((e) => e.isUpload).length,
     adminLike: endpoints.filter((e) => e.looksAdmin).length,
+    apiLike: endpoints.filter((e) => e.isApiLike).length,
     forms: evidence.forms.length,
     endpoints,
     goalCatalog,
@@ -64,6 +74,7 @@ interface EndpointFlags {
   hasForm: boolean;
   isUpload: boolean;
   looksAdmin: boolean;
+  isApiLike: boolean;
 }
 
 /**
@@ -72,7 +83,11 @@ interface EndpointFlags {
  * infrastructure) are always applicable — they describe the whole target.
  */
 function applicableGoalIds(catalog: AttackSurfaceGoal[], flags: EndpointFlags): string[] {
-  const hasInput = flags.hasQueryParams || flags.hasForm;
+  // An API-like endpoint (/api, /graphql, bodied method) accepts input through
+  // its body even when the crawled URL carries no `?query`. Treating it as
+  // input-bearing is what stops injection/API checks being silently skipped on
+  // JSON/REST APIs — the single biggest coverage gap in the old logic.
+  const hasInput = flags.hasQueryParams || flags.hasForm || flags.isApiLike;
   return catalog
     .filter((g) => {
       switch (g.category) {
@@ -82,14 +97,14 @@ function applicableGoalIds(catalog: AttackSurfaceGoal[], flags: EndpointFlags): 
         case 'access-control':
         case 'authorization':
         case 'multi-tenant':
-          return flags.hasPathId || flags.authGated;
+          return flags.hasPathId || flags.authGated || flags.isApiLike;
         case 'auth':
-          return flags.authGated || flags.hasForm;
+          return flags.authGated || flags.hasForm || flags.isApiLike;
         case 'api':
           return hasInput || flags.hasPathId;
         case 'business-logic':
         case 'payment':
-          return flags.hasForm || flags.hasQueryParams;
+          return flags.hasForm || flags.hasQueryParams || flags.isApiLike;
         case 'files':
           return flags.isUpload || flags.hasPathId;
         // headers / configuration / infrastructure / reporting apply target-wide
@@ -98,6 +113,18 @@ function applicableGoalIds(catalog: AttackSurfaceGoal[], flags: EndpointFlags): 
       }
     })
     .map((g) => g.id);
+}
+
+/**
+ * True when the endpoint is a programmatic API surface: a recognizable API path
+ * prefix, GraphQL, or any state-changing/bodied HTTP method. These accept input
+ * via the request body, so input-driven goals apply even without a query string.
+ */
+function endpointLooksApi(url: string, method: string): boolean {
+  const m = method.toUpperCase();
+  if (m === 'POST' || m === 'PUT' || m === 'PATCH' || m === 'DELETE') return true;
+  const path = safePath(url).toLowerCase();
+  return /(^\/api(\/|$)|\/graphql|\/rest(\/|$)|^\/v\d+(\/|$)|\/v\d+\/)/.test(path);
 }
 
 function urlHasQuery(url: string): boolean {

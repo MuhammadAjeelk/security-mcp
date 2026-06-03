@@ -55,4 +55,57 @@ describe('PROBE_LIBRARY', () => {
     });
     expect(r.triggered).toBe(true);
   });
+
+  it('SSTI probe fires only when the expression evaluates (49), not when echoed verbatim', () => {
+    const ssti = PROBE_LIBRARY.find((p) => p.id === 'ssti.arithmetic-marker')!;
+    expect(ssti.detect({ status: 200, headers: {}, body: 'result: smcp49', durationMs: 1 }).triggered).toBe(true);
+    expect(
+      ssti.detect({ status: 200, headers: {}, body: 'echo: smcp{{7*7}}${7*7}', durationMs: 1 }).triggered,
+    ).toBe(false);
+  });
+
+  it('CORS probe fires on reflected foreign Origin with credentials', () => {
+    const cors = PROBE_LIBRARY.find((p) => p.id === 'cors.origin-reflection')!;
+    const r = cors.detect({
+      status: 200,
+      headers: {
+        'access-control-allow-origin': 'https://smcp-evil.invalid',
+        'access-control-allow-credentials': 'true',
+      },
+      body: '',
+      durationMs: 1,
+    });
+    expect(r.triggered).toBe(true);
+  });
+
+  it('GraphQL introspection probe fires when a schema is returned', () => {
+    const gql = PROBE_LIBRARY.find((p) => p.id === 'graphql.introspection-enabled')!;
+    const r = gql.detect({
+      status: 200,
+      headers: {},
+      body: '{"data":{"__schema":{"types":[{"name":"User"}]}}}',
+      durationMs: 1,
+    });
+    expect(r.triggered).toBe(true);
+    expect(gql.mode).toBe('body');
+    expect(gql.appliesTo?.test('http://x/graphql')).toBe(true);
+  });
+
+  it('XXE probe fires when the internal entity is expanded', () => {
+    const xxe = PROBE_LIBRARY.find((p) => p.id === 'xxe.entity-canary')!;
+    expect(
+      xxe.detect({ status: 200, headers: {}, body: '<v>SMCP_XXE_CANARY</v>', durationMs: 1 }).triggered,
+    ).toBe(true);
+  });
+
+  it('host-header probe fires when spoofed host is reflected in Location', () => {
+    const hh = PROBE_LIBRARY.find((p) => p.id === 'host-header.injection')!;
+    const r = hh.detect({
+      status: 302,
+      headers: { location: 'http://smcp-evil.invalid/reset?token=x' },
+      body: '',
+      durationMs: 1,
+    });
+    expect(r.triggered).toBe(true);
+  });
 });

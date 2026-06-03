@@ -19,6 +19,8 @@ import { commandInjectionPrompt } from './prompts/injection/command-injection.pr
 import { xssPrompt } from './prompts/injection/xss.prompt.js';
 import { ssrfPrompt } from './prompts/injection/ssrf.prompt.js';
 import { pathTraversalPrompt } from './prompts/injection/path-traversal.prompt.js';
+import { sstiPrompt } from './prompts/injection/ssti.prompt.js';
+import { xxePrompt } from './prompts/injection/xxe.prompt.js';
 
 import { rateLimitPrompt } from './prompts/api-security/rate-limit.prompt.js';
 import { massAssignmentPrompt } from './prompts/api-security/mass-assignment.prompt.js';
@@ -30,6 +32,8 @@ import { webhookPrompt } from './prompts/api-security/webhook.prompt.js';
 import { sensitiveDataPrompt } from './prompts/api-security/sensitive-data.prompt.js';
 import { cachePoisoningPrompt } from './prompts/api-security/cache-poisoning.prompt.js';
 import { deserializationPrompt } from './prompts/api-security/deserialization.prompt.js';
+import { graphqlPrompt } from './prompts/api-security/graphql.prompt.js';
+import { webCacheDeceptionPrompt } from './prompts/api-security/web-cache-deception.prompt.js';
 
 import { paymentAbusePrompt } from './prompts/business-logic/payment-abuse.prompt.js';
 import { couponAbusePrompt } from './prompts/business-logic/coupon-abuse.prompt.js';
@@ -43,6 +47,8 @@ import { envLeakPrompt } from './prompts/config/env-leak.prompt.js';
 import { debugEndpointPrompt } from './prompts/config/debug-endpoint.prompt.js';
 import { securityHeadersPrompt } from './prompts/config/security-headers.prompt.js';
 import { errorLeakagePrompt } from './prompts/config/error-leakage.prompt.js';
+import { clickjackingPrompt } from './prompts/config/clickjacking.prompt.js';
+import { secretScanningPrompt } from './prompts/config/secret-scanning.prompt.js';
 
 import { dependencyRiskPrompt } from './prompts/infrastructure/dependency-risk.prompt.js';
 import { tenantIsolationPrompt } from './prompts/multi-tenant/tenant-isolation.prompt.js';
@@ -68,6 +74,8 @@ export const PROMPT_REGISTRY: readonly SecurityPrompt[] = Object.freeze([
   xssPrompt,
   ssrfPrompt,
   pathTraversalPrompt,
+  sstiPrompt,
+  xxePrompt,
   // api-security
   rateLimitPrompt,
   massAssignmentPrompt,
@@ -79,6 +87,8 @@ export const PROMPT_REGISTRY: readonly SecurityPrompt[] = Object.freeze([
   sensitiveDataPrompt,
   cachePoisoningPrompt,
   deserializationPrompt,
+  graphqlPrompt,
+  webCacheDeceptionPrompt,
   // business-logic
   paymentAbusePrompt,
   couponAbusePrompt,
@@ -92,6 +102,8 @@ export const PROMPT_REGISTRY: readonly SecurityPrompt[] = Object.freeze([
   debugEndpointPrompt,
   securityHeadersPrompt,
   errorLeakagePrompt,
+  clickjackingPrompt,
+  secretScanningPrompt,
   // infrastructure
   dependencyRiskPrompt,
   // multi-tenant

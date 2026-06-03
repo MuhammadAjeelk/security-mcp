@@ -1,5 +1,8 @@
 import { fetchPage } from './http-scanner.js';
 import { discoverWellKnown } from './well-known.js';
+import { runRecon } from './recon.js';
+import { discoverContent } from './content-discovery.js';
+import { extractJsEndpoints } from './js-endpoint-extractor.js';
 import { probeEndpointsPerRole } from './multi-role-prober.js';
 import { validateTarget } from '../policy/target-policy.js';
 import { getEnv } from '../../config/env.js';
@@ -47,6 +50,10 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
   const endpoints: DiscoveredEndpoint[] = [];
   const notes: string[] = [];
 
+  // HTML bodies retained transiently so the JS-bundle extractor can find
+  // <script src> tags. Not serialized into evidence.
+  const htmlByUrl: Record<string, string> = {};
+
   const visited = new Set<string>();
   const queue: Array<{ url: string; depth: number }> = [{ url: root.normalizedUrl, depth: 0 }];
 
@@ -82,6 +89,10 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
       cookiesByUrl[result.page.finalUrl] = result.setCookies;
     }
 
+    if (isHtml(result.headers['content-type'])) {
+      htmlByUrl[result.page.finalUrl] = result.body;
+    }
+
     if (next.depth < maxDepth && isHtml(result.headers['content-type'])) {
       const discovered = extractLinks(result.body, result.page.finalUrl);
       for (const link of discovered.links) {
@@ -101,10 +112,23 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
     }
   }
 
+  // Shared dedup ledger + merge helper for every post-crawl discovery phase.
+  const seenEndpoints = new Set(endpoints.map((e) => `${e.method} ${e.url}`));
+  const mergeEndpoints = (incoming: DiscoveredEndpoint[]) => {
+    for (const e of incoming) {
+      const key = `${e.method} ${e.url}`;
+      if (seenEndpoints.has(key)) continue;
+      seenEndpoints.add(key);
+      endpoints.push(e);
+    }
+  };
+
+  const deepish = opts.request.scanType !== 'quick';
+
   // Map well-known API doc/spec paths (Swagger/OpenAPI/GraphQL). Users often
   // publish a spec at /api/docs or /openapi.json and forget it is world-readable;
   // parsing it enumerates API operations the HTML crawl never links to.
-  if (opts.request.scanType !== 'quick' && requestCount < maxRequests) {
+  if (deepish && requestCount < maxRequests) {
     try {
       const wellKnown = await discoverWellKnown({
         rootUrl: root.normalizedUrl,
@@ -115,18 +139,81 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
         maxRequests: maxRequests - requestCount,
       });
       requestCount += wellKnown.requestCount;
-      const seen = new Set(endpoints.map((e) => `${e.method} ${e.url}`));
-      for (const e of wellKnown.endpoints) {
-        const key = `${e.method} ${e.url}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        endpoints.push(e);
-      }
+      mergeEndpoints(wellKnown.endpoints);
       notes.push(...wellKnown.notes);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       notes.push(`Well-known discovery skipped: ${message}`);
       opts.audit.event('well-known.error', { reason: message });
+    }
+  }
+
+  // Passive recon: robots.txt + sitemap.xml. Cheap and high-signal — Disallow
+  // entries point straight at paths the owner wanted hidden.
+  if (deepish && requestCount < maxRequests) {
+    try {
+      const recon = await runRecon({
+        rootUrl: root.normalizedUrl,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount,
+      });
+      requestCount += recon.requestCount;
+      mergeEndpoints(recon.endpoints);
+      notes.push(...recon.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`Recon skipped: ${message}`);
+      opts.audit.event('recon.error', { reason: message });
+    }
+  }
+
+  // Pull API/route paths out of same-origin JS bundles (where SPA APIs hide).
+  if (deepish && requestCount < maxRequests && Object.keys(htmlByUrl).length > 0) {
+    try {
+      const jsResult = await extractJsEndpoints({
+        rootUrl: root.normalizedUrl,
+        pages,
+        htmlByUrl,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount,
+      });
+      requestCount += jsResult.requestCount;
+      mergeEndpoints(jsResult.endpoints);
+      notes.push(...jsResult.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`JS endpoint extraction skipped: ${message}`);
+      opts.audit.event('js-extract.error', { reason: message });
+    }
+  }
+
+  // Wordlist content discovery — opt-in (default on for deep scans) since it is
+  // the heaviest phase. Brute-forces curated high-signal paths/files.
+  const wantContentDiscovery =
+    opts.request.includeContentDiscovery ?? opts.request.scanType === 'deep';
+  if (wantContentDiscovery && requestCount < maxRequests) {
+    try {
+      const content = await discoverContent({
+        rootUrl: root.normalizedUrl,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount,
+      });
+      requestCount += content.requestCount;
+      mergeEndpoints(content.endpoints);
+      notes.push(...content.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`Content discovery skipped: ${message}`);
+      opts.audit.event('content-discovery.error', { reason: message });
     }
   }
 

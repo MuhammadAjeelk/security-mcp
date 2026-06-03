@@ -20,7 +20,7 @@ Parse `$ARGUMENTS`:
 
 ## Goals
 
-Your goal set **is** the prompt registry (the ~39 modules from `list_security_prompts`). The audit is complete when every goal that is *applicable* to the discovered attack surface has been evaluated and given a verdict.
+Your goal set **is** the prompt registry (the ~45 modules from `list_security_prompts`, now including SSTI, XXE, GraphQL abuse, clickjacking, secret-scanning and web-cache-deception). The audit is complete when every goal that is *applicable* to the discovered attack surface has been evaluated and given a verdict.
 
 ## Procedure
 
@@ -28,9 +28,13 @@ Your goal set **is** the prompt registry (the ~39 modules from `list_security_pr
 1. `validate_target` → if blocked, STOP.
 2. `security_scan` with:
    ```json
-   { "targetUrl": "<url>", "scanType": "deep", "includeActiveProbes": true, "includeTemplates": true, "testAccounts": [ ...from --account flags... ] }
+   { "targetUrl": "<url>", "scanType": "deep", "includeActiveProbes": true, "includeTemplates": true, "includeContentDiscovery": true, "registerAccounts": true, "testAccounts": [ ...from --account flags... ] }
    ```
-3. Read `evidence.attackSurface` from the result. This is your deterministic map: every endpoint with flags (params / path-id / auth-gated / form / upload / admin) and, per endpoint, the `applicableGoals` (prompt-module ids worth running). Note the summary counts.
+   - `includeContentDiscovery` brute-forces a curated wordlist of high-signal paths/files (admin panels, backups, `.git`, configs) plus parses `robots.txt`/`sitemap.xml` and same-origin JS bundles for endpoints the HTML crawl never links.
+   - `registerAccounts` runs the **self-registration + self-healing** routine for you (see Step 1.5) — it discovers signup, creates throwaway accounts, and probes mass-assignment privilege escalation automatically. Results land in `evidence.autoRegister`.
+3. Read `evidence.attackSurface` from the result. This is your deterministic map: every endpoint with flags (params / path-id / auth-gated / form / upload / admin / **api-like**) and, per endpoint, the `applicableGoals` (prompt-module ids worth running). Note the summary counts. **`isApiLike`** endpoints (`/api`, `/graphql`, or POST/PUT/PATCH/DELETE) are treated as input-bearing even without a `?query`, so injection/API goals apply to JSON/REST APIs.
+   - **Use `evidence.apiPayloadHints`** — for bodied API endpoints, the payload finder already inferred the exact request shape (required fields + a concrete benign payload) by reading the server's own validation errors. Reuse these payloads to actually exercise the endpoint when running injection / auth / business-logic checks, instead of guessing the body.
+   - **Use `evidence.autoRegister`** — if it captured sessions, feed them back as `testAccounts`/`session` on a follow-up `security_scan` to unlock the multi-role differential (IDOR/BOLA/tenant). If `privilegeEscalation` is set, that is a **critical** finding already.
    - **Enumerate the full API.** The scan auto-probes well-known doc/spec paths (`/api/docs`, `/swagger`, `/openapi.json`, `/v3/api-docs`, `/graphql`, …) and parses any Swagger/OpenAPI spec it finds into `evidence.endpoints` (source `well-known` / `api-spec`). Treat an exposed, unauthenticated spec as a finding in its own right (information disclosure) **and** as a map — every operation it declares is an endpoint to evaluate, even ones the HTML crawl never linked. If you suspect spec paths the scan missed, fetch a couple of likely candidates yourself before concluding the API is fully mapped.
 4. Initialise a coverage ledger at `./reports/<host>-coverage.md` — one line per goal in `attackSurface.goalCatalog`, all starting `not-tested`. This file is your memory across iterations.
 
@@ -77,6 +81,91 @@ The owner wants the report **in the conversation, not just on disk**. So:
 - **Print the full rendered Markdown report directly in your reply** (the `markdown` field returned by `generate_report`). Do not just hand them a file path.
 - Then add a short plain-language wrap-up: overall risk, the single most urgent fix, and the coverage stat (e.g. "31/34 applicable goals tested, 3 N/A").
 - Mention the saved file paths at the very end as a convenience, but the report itself lives in the thread.
+
+## Attacker technique playbook — run these against EVERY applicable endpoint
+
+These are the moves real attackers use against the routes this kind of app exposes. The engine now
+automates the read-only ones (the BFLA prober and the registration mass-assignment probe run inside
+`security_scan` — see their findings under `category: access-control`), but YOU must reason about
+them per-endpoint and confirm/extend them. For each that applies, record a ledger verdict.
+
+### A. Mass assignment → privilege escalation (OWASP API6 / API3)
+On **every** create/update endpoint (`POST`/`PUT`/`PATCH` to `/users`, `/register`, `/profile`,
+`/account`, `/settings`, and object endpoints), submit privilege-bearing fields the form/spec never
+advertised, then **read the object back** (`/me`, `/account`, profile, JWT claims) to see if the
+server persisted them:
+```
+role=admin   is_admin=true   isAdmin=true   admin=true   accountType=admin
+permissions=["*"]   roles=["admin"]   groups=["administrators"]   isStaff=true
+verified=true   emailVerified=true   approved=true   status="active"   balance=999999
+userId=<other>   id=<other>   organizationId=<other>   tenantId=<other>
+```
+Send them in BOTH JSON and form encodings, and as nested objects (`{"user":{"role":"admin"}}`).
+- **Vulnerable signal:** the field is reflected/persisted on read-back, or the JWT/claims show the
+  elevated value, or a normally-forbidden action now succeeds. → **critical**.
+- **Secure signal:** field silently ignored, stripped, or rejected (e.g. NestJS `whitelist:true`,
+  Rails strong params, Spring allowlists). Note it as `clean`.
+- Only ever escalate accounts **you created**. Never modify existing users' objects.
+
+### B. BFLA — Broken Function Level Authorization (OWASP API5)
+For every `admin`/`internal`/`management`/privileged route in the surface:
+1. Call it **unauthenticated** — any `2xx` = critical break.
+2. Call it as a **low-privilege** account — a non-admin getting `2xx` on an admin function = high.
+3. **Method swap:** if `GET /api/admin/users` is gated, try `POST`/`PUT`/`HEAD`/`OPTIONS`; gates are
+   often method-specific.
+4. **Header bypass tricks** (the gate may trust attacker-controlled headers):
+   `X-Forwarded-For: 127.0.0.1`, `X-Real-IP`, `X-Originating-IP`, `X-Custom-IP-Authorization`,
+   `X-Forwarded-Host`, `X-Original-URL: /admin`, `X-Rewrite-URL`, `Role: admin`, `X-Role: admin`.
+5. **Path-normalization bypass:** `/api/admin/..;/users`, `//admin`, `/admin/.`, `/Admin`, `%2e`,
+   trailing `%2f`, case changes.
+
+### C. BOLA / IDOR (OWASP API1)
+On `/{id}`-shaped routes, with TWO accounts, request account-A's object id while authenticated as
+account-B. Returned data that belongs to A = **BOLA**. Try numeric increment/decrement, UUID swaps,
+and predictable ids. Also test on `DELETE`/`PATCH` **only against objects you own** — reason about
+others, do not mutate them.
+
+### D. The universal verdict rule (avoid false positives)
+Across ALL of A–C, the server *should* deny the request (401/403/404/422); a vulnerable server
+silently honors it. So the detector is the same everywhere:
+> **VULNERABLE only on `2xx` + the privileged effect/foreign data.** A bare `2xx` is NOT proof —
+> confirm it: for mass assignment, **read the object back** and check the injected field persisted
+> (or appears in the returned object / JWT claims); for header/path bypass, diff the **body
+> length/hash** vs the gated baseline (catches soft-200 error pages); for BOLA, diff the body to
+> confirm it is *another principal's* data. Treat `405` as method-blocked (secure-leaning), `403/401`
+> as denied, `404` as ambiguous-but-denied.
+
+### E. Real-world case studies (cite these in your write-up)
+- **GitHub, 2012 (Homakov)** — mass assignment. Posted `public_key[user_id]=<rails org id>` to the
+  SSH-key form; Rails `update_attributes` bound the unexpected field and reassigned his key to the
+  rails org → commit access. This is *why* Rails shipped Strong Parameters.
+  ([writeup](http://homakov.blogspot.com/2012/03/how-to.html))
+- **Shopify (HackerOne)** — mass assignment **+ BFLA**. A normal user replayed an authenticated
+  request against the admin-only `POST /users/create_admin` with `user[...]` params and got a full
+  admin account — no function-level role check.
+  ([report](https://www.hackerone.com/blog/how-privilege-escalation-led-unrestricted-admin-account-creation-shopify))
+- **crAPI (OWASP)** — `PUT /orders/{id}` accepted an undocumented `{"status":"returned"}` → auto
+  refund/credit. ([cobalt](https://www.cobalt.io/blog/mass-assignment-apis-exploitation-in-the-wild))
+- **PortSwigger lab** — front-end blocks `/admin`, back-end honors `X-Original-URL: /admin/delete?...`
+  → deletes a user. ([lab](https://portswigger.net/web-security/access-control/lab-url-based-access-control-can-be-circumvented))
+- **XFF trust** — servers treating `X-Forwarded-For: 127.0.0.1` as "local" granted `wp-admin`.
+  ([shubs.io](https://shubs.io/enumerating-ips-in-x-forwarded-headers-to-bypass-403-restrictions/))
+- **BOLA (OWASP API1:2023, #1 risk)** — id-swap on `/shops/{name}/revenue_data.json`; Parler/T-Mobile
+  scrapes via sequential, unauthenticated object ids.
+  ([OWASP API1](https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/),
+  [API5 BFLA](https://owasp.org/API-Security/editions/2023/en/0xa5-broken-function-level-authorization/),
+  [Mass Assignment Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html))
+
+**Framework guards to verify are actually ON** (not just available): Rails Strong Params
+(`permit`, never `permit!`); Spring `@InitBinder setAllowedFields`/DTOs; Django/DRF explicit
+`fields` (never `'__all__'`, never expose `is_staff`/`is_superuser`); Laravel `$fillable`/`$guarded`
+(avoid `$guarded=[]`); **NestJS `ValidationPipe({whitelist:true, forbidNonWhitelisted:true})` + DTOs**;
+Mongoose `_.pick(req.body, safeFields)` (never `new User(req.body)`).
+
+> If `--account` tokens (ideally one admin + one normal) are supplied, A–C become provable via the
+> two-account differential. If not, run the unauthenticated and header-trick variants, self-register
+> where possible, and mark the rest `partial` / `not-applicable` with the reason — never claim
+> `clean` for a check you could not actually run.
 
 ## Do NOT
 - Set `includeServerSidePromptLoop: true`.

@@ -1,0 +1,25 @@
+id: ds-store-exposed
+info:
+  name: Exposed .DS_Store (directory listing leak)
+  severity: low
+  description: >-
+    A reachable .DS_Store file leaks macOS directory contents, helping an
+    attacker enumerate hidden files and paths.
+  tags: [exposure, info-leak]
+  reference:
+    - https://book.hacktricks.xyz/network-services-pentesting/pentesting-web/dot-ds_store
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /.DS_Store
+      - /static/.DS_Store
+      - /assets/.DS_Store
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: word
+        part: body
+        words:
+          - "Bud1"

@@ -1,0 +1,23 @@
+id: npmrc-netrc-exposed
+info:
+  name: Exposed .npmrc / .netrc credentials
+  severity: high
+  description: >-
+    .npmrc and .netrc commonly contain auth tokens / registry credentials in
+    plaintext. A reachable copy leaks them.
+  tags: [exposure, secrets]
+confidence: high
+requests:
+  - method: GET
+    paths:
+      - /.npmrc
+      - /.netrc
+      - /.pypirc
+    matchersCondition: and
+    matchers:
+      - type: status
+        status: [200]
+      - type: regex
+        part: body
+        regex:
+          - '(_authToken|_password|machine\s+\S+\s+login|password\s*=|api_key\s*=)'
