@@ -41,6 +41,8 @@ const EnvSchema = z.object({
   SCAN_BRUTE_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(20),
   /** Requests sent in the rate-limit precheck burst before brute-forcing. */
   SCAN_RATELIMIT_SAMPLE: z.coerce.number().int().min(3).default(20),
+  /** Max candidates the undocumented-API-route discovery may probe per scan. */
+  SCAN_API_DISCOVERY_MAX: z.coerce.number().int().min(0).default(120),
   PROMPT_LOOP_MAX_ITERATIONS: z.coerce.number().int().positive().default(3),
   REPORTS_DIR: z.string().default('./reports'),
   LLM_PROVIDER: z.enum(['mock', 'anthropic']).default('mock'),

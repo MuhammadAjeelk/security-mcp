@@ -3,6 +3,7 @@ import { discoverWellKnown } from './well-known.js';
 import { runRecon } from './recon.js';
 import { discoverContent } from './content-discovery.js';
 import { extractJsEndpoints } from './js-endpoint-extractor.js';
+import { discoverApiRoutes } from './api-route-discovery.js';
 import { probeEndpointsPerRole } from './multi-role-prober.js';
 import { validateTarget } from '../policy/target-policy.js';
 import { getEnv } from '../../config/env.js';
@@ -190,6 +191,31 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
       const message = err instanceof Error ? err.message : String(err);
       notes.push(`JS endpoint extraction skipped: ${message}`);
       opts.audit.event('js-extract.error', { reason: message });
+    }
+  }
+
+  // Undocumented API-route discovery — brute-force API resource names under
+  // every prefix we have evidence for (the spec/crawl only show advertised
+  // routes; legacy/internal/admin routes are usually undocumented). Runs after
+  // the other discovery so it can derive prefixes from everything found so far.
+  if (deepish && requestCount < maxRequests) {
+    try {
+      const apiRoutes = await discoverApiRoutes({
+        rootUrl: root.normalizedUrl,
+        knownEndpoints: endpoints,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount,
+      });
+      requestCount += apiRoutes.requestCount;
+      mergeEndpoints(apiRoutes.endpoints);
+      notes.push(...apiRoutes.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`API-route discovery skipped: ${message}`);
+      opts.audit.event('api-discovery.error', { reason: message });
     }
   }
 

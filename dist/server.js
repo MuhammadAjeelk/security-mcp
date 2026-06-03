@@ -36873,6 +36873,8 @@ var EnvSchema = external_exports.object({
   SCAN_BRUTE_CONCURRENCY: external_exports.coerce.number().int().min(1).max(100).default(20),
   /** Requests sent in the rate-limit precheck burst before brute-forcing. */
   SCAN_RATELIMIT_SAMPLE: external_exports.coerce.number().int().min(3).default(20),
+  /** Max candidates the undocumented-API-route discovery may probe per scan. */
+  SCAN_API_DISCOVERY_MAX: external_exports.coerce.number().int().min(0).default(120),
   PROMPT_LOOP_MAX_ITERATIONS: external_exports.coerce.number().int().positive().default(3),
   REPORTS_DIR: external_exports.string().default("./reports"),
   LLM_PROVIDER: external_exports.enum(["mock", "anthropic"]).default("mock"),
@@ -37585,6 +37587,265 @@ function dedupe2(endpoints) {
   return out;
 }
 
+// src/core/scanner/http-request.ts
+var import_undici2 = __toESM(require_undici(), 1);
+var MAX_BODY_BYTES2 = 256 * 1024;
+async function sendRequest(input) {
+  const env = getEnv();
+  const decision = validateTarget(input.url, { extraAllowedHosts: input.extraAllowedHosts });
+  if (!decision.allowed) {
+    throw new Error(`Refusing to request ${input.url}: ${decision.reason}`);
+  }
+  const headers = {
+    "user-agent": "security-mcp/0.4 (+authorized-testing-only)",
+    accept: "application/json, text/html;q=0.9, */*;q=0.5",
+    ...lower(input.headers)
+  };
+  if (input.account?.token) headers["authorization"] = `Bearer ${input.account.token}`;
+  else if (input.session?.bearerToken) headers["authorization"] = `Bearer ${input.session.bearerToken}`;
+  const cookies = { ...input.session?.cookies ?? {}, ...input.account?.cookies ?? {} };
+  if (Object.keys(cookies).length > 0) {
+    headers["cookie"] = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), input.timeoutMs ?? env.SCAN_TIMEOUT_MS);
+  const start = Date.now();
+  try {
+    const response = await (0, import_undici2.request)(input.url, {
+      method: input.method.toUpperCase(),
+      headers,
+      body: input.body,
+      signal: controller.signal,
+      maxRedirections: 0
+    });
+    const flat = {};
+    for (const [k, v] of Object.entries(response.headers)) {
+      if (v === void 0) continue;
+      flat[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
+    }
+    const setCookieRaw = response.headers["set-cookie"];
+    const setCookies = Array.isArray(setCookieRaw) ? setCookieRaw : setCookieRaw ? [String(setCookieRaw)] : [];
+    const text = (await response.body.text()).slice(0, MAX_BODY_BYTES2);
+    return {
+      status: response.statusCode,
+      headers: flat,
+      body: text,
+      setCookies,
+      durationMs: Date.now() - start
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function lower(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers ?? {})) out[k.toLowerCase()] = v;
+  return out;
+}
+function cookiesFromSetCookie(setCookies) {
+  const out = {};
+  for (const raw of setCookies) {
+    const first = raw.split(";")[0] ?? "";
+    const eq = first.indexOf("=");
+    if (eq <= 0) continue;
+    const name = first.slice(0, eq).trim();
+    const value = first.slice(eq + 1).trim();
+    if (name) out[name] = value;
+  }
+  return out;
+}
+
+// src/core/scanner/api-route-discovery.ts
+var API_RESOURCES = Object.freeze([
+  "users",
+  "user",
+  "accounts",
+  "account",
+  "me",
+  "profile",
+  "profiles",
+  "admin",
+  "admins",
+  "auth",
+  "login",
+  "logout",
+  "register",
+  "signup",
+  "password",
+  "roles",
+  "role",
+  "permissions",
+  "groups",
+  "orders",
+  "order",
+  "payments",
+  "transactions",
+  "invoices",
+  "subscriptions",
+  "billing",
+  "checkout",
+  "products",
+  "items",
+  "files",
+  "file",
+  "upload",
+  "uploads",
+  "download",
+  "export",
+  "import",
+  "reports",
+  "report",
+  "notifications",
+  "messages",
+  "comments",
+  "search",
+  "settings",
+  "config",
+  "health",
+  "status",
+  "metrics",
+  "debug",
+  "internal",
+  "webhooks",
+  "tokens",
+  "sessions",
+  "keys",
+  "api-keys",
+  "audit",
+  "logs",
+  "events",
+  "jobs",
+  "tasks",
+  "organizations",
+  "orgs",
+  "tenants",
+  "teams",
+  "projects",
+  "dashboard",
+  "verify",
+  "verify-email",
+  "reset-password"
+]);
+var DEFAULT_PREFIXES = Object.freeze([
+  "",
+  "/api",
+  "/api/v1",
+  "/api/v2",
+  "/v1",
+  "/v2",
+  "/rest",
+  "/internal",
+  "/admin"
+]);
+var DEAD_STATUSES = /* @__PURE__ */ new Set([404, 410]);
+async function discoverApiRoutes(opts) {
+  const env = getEnv();
+  const origin = new URL(opts.rootUrl).origin;
+  const endpoints = [];
+  const notes = [];
+  let requestCount = 0;
+  const prefixes = derivePrefixes(opts.knownEndpoints, origin);
+  const budget = Math.min(opts.maxRequests, env.SCAN_API_DISCOVERY_MAX);
+  opts.audit.event("api-discovery.start", { prefixes: [...prefixes], budget });
+  const baseline = /* @__PURE__ */ new Map();
+  const seen = /* @__PURE__ */ new Set();
+  outer: for (const prefix of prefixes) {
+    if (requestCount >= budget) break;
+    if (!baseline.has(prefix) && requestCount < budget) {
+      const probe2 = await safeGet(`${origin}${prefix}/smcp-nope-${prefix.length}xz9`, opts);
+      requestCount += 1;
+      if (probe2) baseline.set(prefix, { status: probe2.status, length: probe2.body.length });
+    }
+    const base = baseline.get(prefix);
+    for (const resource of API_RESOURCES) {
+      if (requestCount >= budget) break outer;
+      const path = `${prefix}/${resource}`.replace(/\/+/g, "/");
+      const url = origin + path;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const res = await safeGet(url, opts);
+      requestCount += 1;
+      if (!res) continue;
+      if (DEAD_STATUSES.has(res.status)) continue;
+      if (base && base.status === res.status && Math.abs(base.length - res.body.length) < 16 && res.status >= 200 && res.status < 300) {
+        continue;
+      }
+      endpoints.push({ url, method: "GET", source: "api-discovery" });
+      if (res.status === 401 || res.status === 403 || res.status === 405) {
+        notes.push(`Undocumented protected route ${path} \u2192 ${res.status} (exists, gated).`);
+      }
+      if (requestCount < budget) {
+        const allow = await optionsAllow(url, opts);
+        requestCount += 1;
+        for (const m of allow) {
+          if (m === "GET" || m === "HEAD" || m === "OPTIONS") continue;
+          endpoints.push({ url, method: m, source: "api-discovery" });
+        }
+      }
+    }
+  }
+  notes.push(`API-route discovery probed ${requestCount} candidates; found ${endpoints.length} route entries.`);
+  opts.audit.event("api-discovery.done", { requestCount, found: endpoints.length });
+  return { endpoints, notes, requestCount };
+}
+function derivePrefixes(known, origin) {
+  const prefixes = new Set(DEFAULT_PREFIXES);
+  for (const e of known) {
+    let path;
+    try {
+      const u = new URL(e.url, origin);
+      if (u.origin !== origin) continue;
+      path = u.pathname;
+    } catch {
+      continue;
+    }
+    const segs = path.split("/").filter(Boolean);
+    const acc = [];
+    for (const seg of segs.slice(0, 3)) {
+      if (/^(api|rest|internal|admin|v\d+)$/i.test(seg)) {
+        acc.push(seg);
+        prefixes.add("/" + acc.join("/"));
+      } else if (acc.length > 0) {
+        break;
+      } else {
+        break;
+      }
+    }
+  }
+  return prefixes;
+}
+async function safeGet(url, opts) {
+  try {
+    const r = await fetchPage({
+      url,
+      depth: 0,
+      extraAllowedHosts: opts.extraAllowedHosts,
+      account: opts.account,
+      session: opts.session,
+      audit: opts.audit
+    });
+    return { status: r.page.status, body: r.body };
+  } catch {
+    return null;
+  }
+}
+async function optionsAllow(url, opts) {
+  try {
+    const r = await sendRequest({
+      url,
+      method: "OPTIONS",
+      account: opts.account,
+      session: opts.session,
+      extraAllowedHosts: opts.extraAllowedHosts
+    });
+    const allow = r.headers["allow"] || r.headers["access-control-allow-methods"];
+    if (!allow) return [];
+    return allow.split(",").map((m) => m.trim().toUpperCase()).filter((m) => /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)$/.test(m));
+  } catch {
+    return [];
+  }
+}
+
 // src/core/scanner/multi-role-prober.ts
 async function probeEndpointsPerRole(input) {
   const results = {};
@@ -37792,6 +38053,26 @@ async function crawlTarget(opts) {
       const message = err instanceof Error ? err.message : String(err);
       notes.push(`JS endpoint extraction skipped: ${message}`);
       opts.audit.event("js-extract.error", { reason: message });
+    }
+  }
+  if (deepish && requestCount < maxRequests) {
+    try {
+      const apiRoutes = await discoverApiRoutes({
+        rootUrl: root.normalizedUrl,
+        knownEndpoints: endpoints,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount
+      });
+      requestCount += apiRoutes.requestCount;
+      mergeEndpoints(apiRoutes.endpoints);
+      notes.push(...apiRoutes.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`API-route discovery skipped: ${message}`);
+      opts.audit.event("api-discovery.error", { reason: message });
     }
   }
   const wantContentDiscovery = opts.request.includeContentDiscovery ?? opts.request.scanType === "deep";
@@ -39837,74 +40118,6 @@ function safePath(url) {
 
 // src/core/scanner/probe-runner.ts
 var import_undici3 = __toESM(require_undici(), 1);
-
-// src/core/scanner/http-request.ts
-var import_undici2 = __toESM(require_undici(), 1);
-var MAX_BODY_BYTES2 = 256 * 1024;
-async function sendRequest(input) {
-  const env = getEnv();
-  const decision = validateTarget(input.url, { extraAllowedHosts: input.extraAllowedHosts });
-  if (!decision.allowed) {
-    throw new Error(`Refusing to request ${input.url}: ${decision.reason}`);
-  }
-  const headers = {
-    "user-agent": "security-mcp/0.4 (+authorized-testing-only)",
-    accept: "application/json, text/html;q=0.9, */*;q=0.5",
-    ...lower(input.headers)
-  };
-  if (input.account?.token) headers["authorization"] = `Bearer ${input.account.token}`;
-  else if (input.session?.bearerToken) headers["authorization"] = `Bearer ${input.session.bearerToken}`;
-  const cookies = { ...input.session?.cookies ?? {}, ...input.account?.cookies ?? {} };
-  if (Object.keys(cookies).length > 0) {
-    headers["cookie"] = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs ?? env.SCAN_TIMEOUT_MS);
-  const start = Date.now();
-  try {
-    const response = await (0, import_undici2.request)(input.url, {
-      method: input.method.toUpperCase(),
-      headers,
-      body: input.body,
-      signal: controller.signal,
-      maxRedirections: 0
-    });
-    const flat = {};
-    for (const [k, v] of Object.entries(response.headers)) {
-      if (v === void 0) continue;
-      flat[k.toLowerCase()] = Array.isArray(v) ? v.join(", ") : String(v);
-    }
-    const setCookieRaw = response.headers["set-cookie"];
-    const setCookies = Array.isArray(setCookieRaw) ? setCookieRaw : setCookieRaw ? [String(setCookieRaw)] : [];
-    const text = (await response.body.text()).slice(0, MAX_BODY_BYTES2);
-    return {
-      status: response.statusCode,
-      headers: flat,
-      body: text,
-      setCookies,
-      durationMs: Date.now() - start
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-function lower(headers) {
-  const out = {};
-  for (const [k, v] of Object.entries(headers ?? {})) out[k.toLowerCase()] = v;
-  return out;
-}
-function cookiesFromSetCookie(setCookies) {
-  const out = {};
-  for (const raw of setCookies) {
-    const first = raw.split(";")[0] ?? "";
-    const eq = first.indexOf("=");
-    if (eq <= 0) continue;
-    const name = first.slice(0, eq).trim();
-    const value = first.slice(eq + 1).trim();
-    if (name) out[name] = value;
-  }
-  return out;
-}
 
 // src/core/scanner/probe-library.ts
 var SQL_ERROR_RE = /(SQL syntax|mysql_fetch|ORA-\d{5}|PostgreSQL.*ERROR|SQLite\/JDBCDriver|sqlite3\.OperationalError|unclosed quotation mark|psycopg2)/i;

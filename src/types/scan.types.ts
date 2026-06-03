@@ -240,7 +240,8 @@ export interface DiscoveredEndpoint {
     | 'api-spec'
     | 'recon'
     | 'content-discovery'
-    | 'js-bundle';
+    | 'js-bundle'
+    | 'api-discovery';
 }
 
 export interface ValidateTargetResult {
