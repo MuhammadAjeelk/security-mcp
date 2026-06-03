@@ -105,19 +105,19 @@ npm run typecheck  # tsc --noEmit
 
 ## Install as a Claude Code plugin (recommended)
 
-This repo ships as a Claude Code plugin: it registers the MCP server **and** adds slash commands automatically.
-
-```bash
-# 1. Build the server
-cd /Users/Apple/Documents/Projects/security-mcp
-npm install
-npm run build
-```
-
-Then in Claude Code:
+This repo ships as a Claude Code plugin: it registers the MCP server **and** adds slash commands automatically. The compiled server (`dist/server.js`) is committed and self-contained, so **no build step is required** — just two commands in Claude Code:
 
 ```
-/plugin marketplace add /Users/Apple/Documents/Projects/security-mcp
+/plugin marketplace add MuhammadAjeelk/security-mcp
+/plugin install security-mcp@security-mcp
+```
+
+> `/plugin marketplace add` registers this GitHub repo as a marketplace on your machine (a one-time step). `/plugin install` then pulls the plugin from it. After that, anyone can update with `/plugin marketplace update security-mcp`.
+
+**Local development install** (working inside a clone of this repo instead):
+
+```
+/plugin marketplace add ./
 /plugin install security-mcp@security-mcp
 ```
 

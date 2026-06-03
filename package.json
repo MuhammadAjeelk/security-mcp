@@ -1,8 +1,8 @@
 {
   "name": "security-mcp",
   "version": "0.3.0",
-  "private": true,
-  "description": "Internal MCP server for authorized security testing against localhost/staging targets.",
+  "license": "MIT",
+  "description": "MCP server for authorized security testing against localhost/staging targets.",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
