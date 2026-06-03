@@ -4,6 +4,7 @@ import { runRecon } from './recon.js';
 import { discoverContent } from './content-discovery.js';
 import { extractJsEndpoints } from './js-endpoint-extractor.js';
 import { discoverApiRoutes } from './api-route-discovery.js';
+import { deriveFrontendCandidates, looksLikeApiHost } from './frontend-hints.js';
 import { probeEndpointsPerRole } from './multi-role-prober.js';
 import { validateTarget } from '../policy/target-policy.js';
 import { getEnv } from '../../config/env.js';
@@ -251,6 +252,17 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
         audit: opts.audit,
       })
     : undefined;
+
+  // When the target is an API origin, the signup UI is elsewhere — surface
+  // candidate frontend origins so the audit knows where to find registration.
+  if (looksLikeApiHost(root.normalizedUrl)) {
+    const candidates = deriveFrontendCandidates(root.normalizedUrl);
+    if (candidates.length > 0) {
+      notes.push(
+        `Target looks like an API host; signup UI likely on the frontend. Candidate origins (verify scope + reachability): ${candidates.join(', ')}.`,
+      );
+    }
+  }
 
   const completedAt = new Date().toISOString();
 

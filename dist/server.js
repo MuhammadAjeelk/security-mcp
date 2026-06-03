@@ -37846,6 +37846,47 @@ async function optionsAllow(url, opts) {
   }
 }
 
+// src/core/scanner/frontend-hints.ts
+function deriveFrontendCandidates(targetUrl) {
+  let u;
+  try {
+    u = new URL(targetUrl);
+  } catch {
+    return [];
+  }
+  const host = u.hostname.toLowerCase();
+  const proto = u.protocol === "http:" ? "http:" : "https:";
+  const out = /* @__PURE__ */ new Set();
+  const add = (h) => {
+    if (h && h !== host) out.add(`${proto}//${h}`);
+  };
+  const stripped = host.replace(/^api[-.]/, "");
+  if (stripped !== host) {
+    add(stripped);
+    add(`app.${stripped}`);
+    add(`www.${stripped}`);
+    add(`dashboard.${stripped}`);
+    add(`portal.${stripped}`);
+  }
+  const labels = host.split(".");
+  if (labels.length >= 2) {
+    const parent = labels.slice(-2).join(".");
+    for (const sub of ["app", "www", "staging", "dashboard", "portal", "web"]) {
+      add(`${sub}.${parent}`);
+    }
+    add(parent);
+  }
+  return [...out];
+}
+function looksLikeApiHost(targetUrl) {
+  try {
+    const u = new URL(targetUrl);
+    return /^api[-.]/.test(u.hostname.toLowerCase()) || /\/api(\/|$)/.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
 // src/core/scanner/multi-role-prober.ts
 async function probeEndpointsPerRole(input) {
   const results = {};
@@ -38101,6 +38142,14 @@ async function crawlTarget(opts) {
     extraAllowedHosts: opts.request.allowedHosts,
     audit: opts.audit
   }) : void 0;
+  if (looksLikeApiHost(root.normalizedUrl)) {
+    const candidates = deriveFrontendCandidates(root.normalizedUrl);
+    if (candidates.length > 0) {
+      notes.push(
+        `Target looks like an API host; signup UI likely on the frontend. Candidate origins (verify scope + reachability): ${candidates.join(", ")}.`
+      );
+    }
+  }
   const completedAt = (/* @__PURE__ */ new Date()).toISOString();
   return {
     targetUrl: root.normalizedUrl,
