@@ -3,9 +3,20 @@ import type { ValidateTargetResult } from '../../types/scan.types.js';
 
 /**
  * Substrings that disqualify a hostname even if it is otherwise allowlisted.
- * Matching is case-insensitive on the hostname.
+ * Matching is case-insensitive on the hostname. Checked BEFORE the staging
+ * substring allow, so e.g. `staging-prod.example.com` stays blocked.
  */
 const FORBIDDEN_SUBSTRINGS = ['production', 'prod', 'live'];
+
+/**
+ * Any hostname containing this substring is treated as an authorized staging
+ * target. This is a deliberately broad rule (per project policy): a host like
+ * `api.staging.lynsi.net` is allowed without being named in the env allowlist.
+ * The forbidden-substring check above still wins, and cloud-metadata /
+ * link-local hosts remain blocked. NOTE: this allows ANY `*staging*` host on
+ * the internet — only point the scanner at targets you are authorized to test.
+ */
+const STAGING_SUBSTRING = 'staging';
 
 /**
  * Cloud metadata / link-local IPs that must never be scanned.
@@ -92,6 +103,15 @@ export function validateTarget(
     return {
       allowed: true,
       reason: 'Allowlisted staging host',
+      normalizedUrl: url.toString(),
+      classification: 'staging',
+    };
+  }
+
+  if (hostname.includes(STAGING_SUBSTRING)) {
+    return {
+      allowed: true,
+      reason: `Hostname contains "${STAGING_SUBSTRING}" — treated as authorized staging target`,
       normalizedUrl: url.toString(),
       classification: 'staging',
     };

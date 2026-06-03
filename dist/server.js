@@ -36886,6 +36886,7 @@ function getAllowedHosts() {
 
 // src/core/policy/target-policy.ts
 var FORBIDDEN_SUBSTRINGS = ["production", "prod", "live"];
+var STAGING_SUBSTRING = "staging";
 var BLOCKED_HOSTS = /* @__PURE__ */ new Set(["169.254.169.254", "metadata.google.internal"]);
 var PRIVATE_RANGES_V4 = [
   [ipv4ToInt("10.0.0.0"), 8],
@@ -36942,6 +36943,14 @@ function validateTarget(rawUrl, options = {}) {
     return {
       allowed: true,
       reason: "Allowlisted staging host",
+      normalizedUrl: url.toString(),
+      classification: "staging"
+    };
+  }
+  if (hostname2.includes(STAGING_SUBSTRING)) {
+    return {
+      allowed: true,
+      reason: `Hostname contains "${STAGING_SUBSTRING}" \u2014 treated as authorized staging target`,
       normalizedUrl: url.toString(),
       classification: "staging"
     };

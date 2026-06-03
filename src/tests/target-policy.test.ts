@@ -26,6 +26,20 @@ describe('validateTarget', () => {
     expect(validateTarget('https://dev.example.com/').allowed).toBe(true);
   });
 
+  it('allows any hostname containing "staging" without an explicit allowlist entry', () => {
+    const r = validateTarget('https://api.staging.lynsi.net/');
+    expect(r.allowed).toBe(true);
+    expect(r.classification).toBe('staging');
+    expect(validateTarget('https://web.staging.anything.io/').allowed).toBe(true);
+    expect(validateTarget('https://mystaging.dev/').allowed).toBe(true);
+  });
+
+  it('still blocks a staging host that also looks production-flavored', () => {
+    // forbidden substrings are checked before the staging allow
+    expect(validateTarget('https://staging-prod.example.com/').allowed).toBe(false);
+    expect(validateTarget('https://staging.live.example.com/').allowed).toBe(false);
+  });
+
   it('honours extraAllowedHosts on a per-call basis', () => {
     expect(validateTarget('https://qa.example.com/').allowed).toBe(false);
     expect(
