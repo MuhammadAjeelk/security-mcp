@@ -1,5 +1,5 @@
 ---
-description: Autonomous expert security audit — you act as a 20-year offensive-security lead, enumerate the full attack surface, and Ralph-loop one route at a time (exhausting each route's goals before moving on) until coverage is satisfied. Renders the full report INLINE in this thread.
+description: Autonomous expert security audit — you act as a 20-year offensive-security lead with ONE end goal, full system takeover. Enumerate the surface, Ralph-loop one route at a time, and chain findings into the shortest path to total control (prove, don't pillage). Renders the full report INLINE in this thread.
 argument-hint: <targetUrl> [maxIterations=8] [--account role=..,token=..]
 ---
 
@@ -19,9 +19,21 @@ Parse `$ARGUMENTS`:
 3. **Evidence or it didn't happen.** Every finding carries `severity` + `confidence`. Never claim certainty without concrete evidence. Use `confidence: low` when reasoning is speculative.
 4. **You are the brain.** Do NOT set `includeServerSidePromptLoop`. The MCP collects evidence and runs deterministic checks; YOU do the reasoning.
 
-## Goals
+## THE END GOAL — full system takeover
 
-Your goal set **is** the prompt registry (the ~45 modules from `list_security_prompts`, now including SSTI, XXE, GraphQL abuse, clickjacking, secret-scanning and web-cache-deception). The audit is complete when every goal that is *applicable* to the discovered attack surface has been evaluated and given a verdict.
+Your **single overarching objective** is to determine whether an attacker can achieve **complete compromise of this system**, because the owner's two prior products were breached exactly this way. Don't treat the audit as a checklist — treat every finding as a *stepping stone* and relentlessly ask: **"how does this get me closer to total control?"** Total control means any of:
+- **Admin/superuser access** (mint or escalate to an admin account; reach admin-only functions).
+- **Full data compromise** (read/modify *every* tenant's data — the crown jewels: PII/PHI, finance, credentials).
+- **Auth/identity takeover** (forge/bypass auth, take over arbitrary accounts, defeat verification/MFA).
+- **Code/infra execution** (RCE via injection/upload/deserialization, secrets that unlock cloud/CI/DB).
+
+**Chain, don't enumerate.** Combine weaknesses into the shortest realistic path to control — e.g. *exposed spec → self-register → mass-assign `role=admin` → admin endpoints → export all student PII*, or *no-rate-limit 4-digit verify code → brute-force → account takeover → IDOR across tenants*. A medium finding that completes a chain is more important than an isolated high.
+
+**Prove, don't pillage (hard boundary).** Demonstrate takeover up to the point of *proof of control* — then STOP and document it. Confirm reach with your own accounts and a minimal, read-only proof (e.g. fetch one record id that isn't yours, show the admin route returns 200). Do **not** exfiltrate real users' data in bulk, destroy/modify their data, plant persistence/backdoors, or pivot beyond the authorized scope. The win condition is a written, reproducible *path to takeover*, not actual damage.
+
+## Goals (the means to that end)
+
+The prompt registry (the ~45 modules from `list_security_prompts`, incl. SSTI, XXE, GraphQL, clickjacking, secret-scanning, web-cache-deception) is your **toolkit of techniques** for building that chain. The audit is complete when every applicable goal has a verdict **and** you have either demonstrated a path to takeover or shown, with evidence, that no such path was reachable (and exactly which control stopped each attempted chain).
 
 ## Procedure
 
@@ -123,6 +135,8 @@ Hand the probing off to the **Ralph Loop** plugin so it persists across iteratio
 > Prefer this Ralph-driven per-route loop. If the Ralph Loop plugin is unavailable, fall back to a single-session loop bounded by `maxIterations`, still iterating route-by-route to a verdict before moving on.
 
 ### Step 3 — Generate the report
+First, decide the **takeover verdict**: did you find a path to full system control (per "THE END GOAL")? Build a **path-to-takeover narrative** — the ordered chain of steps an attacker would take, each step citing the finding that enables it, ending at the control achieved (admin / all-tenant data / RCE / identity takeover) or at the exact control that *blocked* the chain. If you could not reach takeover, state the single most load-bearing control that stopped you (so the owner knows what NOT to weaken).
+
 Call `generate_report` with:
 ```json
 {
@@ -131,15 +145,15 @@ Call `generate_report` with:
   "findings": [ ...all findings, each with title, severity, confidence, category, description, evidence, impact, remediation, attackChain... ],
   "evidence": <the evidence object from step 1 — it carries attackSurface>,
   "coverageMatrix": [ ...one row per goal you tracked: { goalId, goalTitle, status, endpointsTested, endpointsTotal, endpoints?, note? }... ],
-  "executiveSummary": "<3-6 sentences: are they safe now? biggest risks? what to fix first?>"
+  "executiveSummary": "<lead with the TAKEOVER VERDICT: could an attacker fully compromise the system, yes/no, and via what chain? Then biggest risks and what to fix first. 4-8 sentences.>"
 }
 ```
-This writes the Markdown + JSON to `./reports/` AND returns the rendered `markdown`.
+Put the full kill-chain in the most relevant finding's `attackChain` field (and reference it in `executiveSummary`). This writes the Markdown + JSON to `./reports/` AND returns the rendered `markdown`.
 
 ### Step 4 — Deliver IN THIS THREAD
 The owner wants the report **in the conversation, not just on disk**. So:
 - **Print the full rendered Markdown report directly in your reply** (the `markdown` field returned by `generate_report`). Do not just hand them a file path.
-- Then add a short plain-language wrap-up: overall risk, the single most urgent fix, and the coverage stat (e.g. "31/34 applicable goals tested, 3 N/A").
+- Then add a short plain-language wrap-up: **lead with the takeover verdict** ("Could an attacker take over the system? Yes/No — here's the chain / here's what stopped them"), then the single most urgent fix to break that chain, and the coverage stat (e.g. "31/34 applicable goals tested, 3 N/A").
 - Mention the saved file paths at the very end as a convenience, but the report itself lives in the thread.
 
 ## Attacker technique playbook — run these against EVERY applicable endpoint
