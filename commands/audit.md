@@ -74,7 +74,16 @@ How the engine keeps it safe (and what it means for your verdict):
 - If there is **no throttling**, it sweeps the full keyspace (up to `SCAN_BRUTE_MAX`, default 1,000,000) at bounded concurrency, **stops on the first accepted code**, and backs off instantly if throttling appears mid-run.
 - A returned `found` code → **critical** (auth/activation bypass): record it, capture the resulting session, and continue the authenticated sweep (Step 1.5 #4). No `found` but no throttling either → **high** "no rate limiting" finding (the engine already emits both).
 
-Point it at **any** API where a short secret guards access — not just signup. Brute-force is bounded by `SCAN_BRUTE_MAX` / `SCAN_BRUTE_CONCURRENCY`; raise them for a larger keyspace, lower them to be gentle on your own server. (This is the one place the audit issues high-volume requests — it only ever fires after confirming the target does not rate-limit, and only against the authorized scope.)
+**Code length matters — don't assume 6.** Real apps use 4-, 5-, 6-, or 8-digit codes (a 4-digit PIN is only 10,000 guesses — seconds with no rate limit). First try to *learn* the length: count the digits in the leaked/sample code (Step 1.6 #1), read the spec/DTO (`minLength`/`maxLength`/`pattern`), or look at the input field (`maxlength`). If you still don't know, submit one `bruteForce` entry **per likely length, cheapest first** — `codeLength: 4`, then `5`, `6`, `8` — each is its own keyspace and the 4-digit sweep finishes almost instantly:
+```json
+"bruteForce": [
+  { "url": "<verify>", "codeParam": "code", "codeLength": 4, "staticFields": { "email": "<acct>" } },
+  { "url": "<verify>", "codeParam": "code", "codeLength": 6, "staticFields": { "email": "<acct>" } }
+]
+```
+(For alphanumeric or longer tokens, brute-force is not the move — those aren't exhaustible; reason about token entropy/leakage instead.)
+
+Point it at **any** API where a short numeric secret guards access — not just signup. Brute-force is bounded by `SCAN_BRUTE_MAX` / `SCAN_BRUTE_CONCURRENCY`; raise them for a larger keyspace, lower them to be gentle on your own server. (This is the one place the audit issues high-volume requests — it only ever fires after confirming the target does not rate-limit, and only against the authorized scope.)
 
 ### Step 2 — Per-route Ralph Loop (one API at a time, until its goals are met)
 
