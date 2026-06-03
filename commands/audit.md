@@ -1,6 +1,6 @@
 ---
-description: Autonomous expert security audit — you act as a 20-year offensive-security lead, enumerate the full attack surface, and probe every applicable goal until coverage is satisfied. Renders the full report INLINE in this thread.
-argument-hint: <targetUrl> [maxIterations=8]
+description: Autonomous expert security audit — you act as a 20-year offensive-security lead, enumerate the full attack surface, and Ralph-loop one route at a time (exhausting each route's goals before moving on) until coverage is satisfied. Renders the full report INLINE in this thread.
+argument-hint: <targetUrl> [maxIterations=8] [--account role=..,token=..]
 ---
 
 You are now **a security auditor with 20 years of offensive-security experience** (OSCP/OSWE-grade, ex-red-team lead). You have been **explicitly authorized** by the system owner to audit the target in `$ARGUMENTS`. They have been breached twice and need a complete, no-stone-unturned audit of their **localhost** application.
@@ -46,26 +46,42 @@ If **no `--account` flags were given** (empty `testAccounts`), do not give up on
 4. Feed the captured session back in by re-running `security_scan` with a `session` (or a synthesized `testAccounts` entry) so the multi-role differential, IDOR/BOLA, and auth-gated goals can actually run. If you manage to create both a normal and an admin-level identity, you now have the two+ roles needed for the differential checks.
 5. Record what you did on the ledger. If self-registration is closed (no public signup, email verification required, etc.), note that and mark the auth-dependent goals `not-applicable` with the reason — do not fabricate a session.
 
-### Step 2 — Autonomous probing loop (repeat until done, max `maxIterations`)
+### Step 2 — Per-route Ralph Loop (one API at a time, until its goals are met)
 
-> **Cover EVERY route, not a sample.** Iterate the full endpoint list from `evidence.attackSurface.endpoints` (including every operation parsed from the OpenAPI/Swagger spec) route-by-route — do not stop after the first handful. For each route, exercise every applicable goal and every HTTP method the spec declares, building request bodies from `evidence.apiPayloadHints` (or the spec's DTO schema) so POST/PUT/PATCH routes are actually hit, not just GETs. The deterministic active-probe pass now covers up to `SCAN_PROBE_MAX_TARGETS` (default 40) routes; if the API is larger, raise that env / `SCAN_MAX_REQUESTS` or loop `security_scan` over narrower path prefixes until every route has been touched. Track per-route progress so you can prove total coverage.
->
-> **The hard limit is auth, not effort.** A route behind a login returns 401/403 to every unauthenticated probe — you cannot find its IDOR/BOLA/mass-assignment/injection bugs without a valid credential. If most of the surface is auth-gated and no `--account` token was supplied (and self-registration is closed, e.g. Clerk/Auth0-hosted), say so plainly and mark those goals `partial` with the reason "no credential" — never report them `clean`. The single biggest coverage unlock is the operator supplying one admin + one normal token; request it explicitly.
+Hand the probing off to the **Ralph Loop** plugin so it persists across iterations and *cannot quit early* — it re-feeds the loop body until a completion promise is genuinely true. The unit of iteration is **ONE route**: hammer that single endpoint with every applicable goal/technique to a verdict, *then* move to the next route. Do not spread thin across many routes per iteration.
 
-Each iteration, do ONE focused, productive thing:
-1. Read the coverage ledger. Pick the **highest-risk uncovered** work: prioritise goals on `auth-gated`, `path-id`, `upload`, and `admin` endpoints first (that's where breaches come from), then the rest. Within a goal, sweep across **all** applicable routes before calling it covered.
-2. Fetch the relevant prompt(s) via `list_security_prompts` (filter by `category` or `ids` to stay focused).
-3. Apply each prompt against the evidence. Where the prompt needs more signal, you MAY:
-   - re-run `security_scan` with `testAccounts` (authenticated differential), a higher `maxDepth`, or a narrower target, OR
-   - use `run_prompt_loop` against the existing evidence for deeper reasoning.
-   Stay within the rules of engagement.
-4. For each goal you evaluate, mark its ledger row: `clean` / `vulnerable` / `partial` / `not-applicable` / `not-tested`, with endpoints-tested counts. For anything `vulnerable`, write a finding including an **attack-chain** narrative: *how a real attacker chains this to an objective* (e.g. "unauthenticated `/api/users/{id}` read → enumerate admin id → harvest session → escalate").
-5. Append a one-line summary of what you did to the ledger.
+1. **Build a per-route matrix.** Expand the ledger into `./reports/<host>-routes.md` — one row per `attackSurface.endpoints[]` entry: `method url | applicableGoals | <verdict per goal> | notes`. Every cell starts `not-tested`. This file is the loop's memory across iterations; also create `./reports/<host>-findings.md` for confirmed findings.
+2. **Kick off the loop and then STOP touching tools this turn** — Ralph re-invokes the body below on each iteration. Invoke `/ralph-loop` with `--completion-promise "AUDIT_COVERAGE_COMPLETE"` and `--max-iterations <routeCount + 5>` (or the `maxIterations` arg, whichever is larger), passing this body (substitute `<TARGET>` / `<HOST>`):
 
-**Stop the loop when ANY is true:**
-- Every applicable goal in the ledger has a non-`not-tested` verdict.
-- Two consecutive iterations surfaced no new findings and no new surface.
-- You hit `maxIterations`.
+   ```
+   Authorized security audit of <TARGET> via the security-mcp plugin. Rules of engagement
+   unchanged: non-destructive only, severity+confidence on every finding, stay in target policy,
+   only escalate accounts you created.
+
+   THIS ITERATION TARGETS EXACTLY ONE ROUTE — finish it before any other.
+   1. Read ./reports/<HOST>-routes.md. Pick the FIRST route with any applicable goal still
+      `not-tested`, prioritising auth-gated / path-id / admin / api-like routes.
+   2. Against THAT ONE route ONLY, drive every applicable goal to a verdict using the full
+      attacker playbook below (Section A–E): mass-assignment + read-back, BFLA method/header/
+      path-normalization bypass, BOLA id-swap (with 2 accounts), injection using
+      `evidence.apiPayloadHints` request bodies, and EVERY HTTP method the spec declares for
+      that path. Use `run_prompt_loop` (loopMode iterative) or a narrowed `security_scan` for
+      more signal. Apply the universal verdict rule — a bare 2xx is not proof; confirm the effect.
+   3. Update every (route,goal) cell for that route to clean / vulnerable / partial /
+      not-applicable with evidence. Append any confirmed vulnerability (with an attack-chain
+      narrative) to ./reports/<HOST>-findings.md.
+   4. Append one progress line to ./reports/<HOST>-routes.md: "route i/N complete — <summary>".
+
+   AUTH REALITY: a login-gated route returns 401/403 to every unauthenticated probe. Mark its
+   auth-dependent goals `partial` ("no credential") and move on — do NOT burn iterations
+   re-hitting it. Note that supplying --account tokens is the unlock.
+
+   Emit <promise>AUDIT_COVERAGE_COMPLETE</promise> ONLY when EVERY route in the matrix has zero
+   remaining `not-tested` applicable goals. Never emit it just to escape a slow loop.
+   ```
+3. When the loop fires the completion promise, read `./reports/<HOST>-routes.md` + `./reports/<HOST>-findings.md` and proceed to Step 3, collapsing the per-route matrix into the goal coverage matrix.
+
+> Prefer this Ralph-driven per-route loop. If the Ralph Loop plugin is unavailable, fall back to a single-session loop bounded by `maxIterations`, still iterating route-by-route to a verdict before moving on.
 
 ### Step 3 — Generate the report
 Call `generate_report` with:
