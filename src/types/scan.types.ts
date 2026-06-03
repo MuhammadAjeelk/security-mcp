@@ -158,7 +158,7 @@ export interface DiscoveredForm {
 export interface DiscoveredEndpoint {
   url: string;
   method: string;
-  source: 'crawler' | 'inline-script' | 'link';
+  source: 'crawler' | 'inline-script' | 'link' | 'well-known' | 'api-spec';
 }
 
 export interface ValidateTargetResult {

@@ -110,7 +110,12 @@ function urlHasQuery(url: string): boolean {
 
 function pathHasId(url: string): boolean {
   const path = safePath(url);
-  return /\/(\d+|[0-9a-f]{8,}|[0-9a-f-]{16,})(\/|$)/i.test(path);
+  // Concrete ids (numeric/hex/UUID) or OpenAPI template params (`{id}`, raw or
+  // percent-encoded as `%7Bid%7D` once normalized through the URL constructor).
+  return (
+    /\/(\d+|[0-9a-f]{8,}|[0-9a-f-]{16,})(\/|$)/i.test(path) ||
+    /(\{[^/}]+\}|%7b[^/]*%7d)/i.test(path)
+  );
 }
 
 function pathLooksAdmin(url: string): boolean {

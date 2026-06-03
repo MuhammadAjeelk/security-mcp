@@ -72,6 +72,17 @@ describe('buildAttackSurface', () => {
     expect(up.applicableGoals.some((g) => g.startsWith('files.'))).toBe(true);
   });
 
+  it('treats OpenAPI template params as path ids so access-control goals apply', () => {
+    const ev = baseEvidence({
+      endpoints: [
+        { url: 'http://localhost:3000/api/v1/users/{id}', method: 'GET', source: 'api-spec' },
+      ],
+    });
+    const s = buildAttackSurface(ev);
+    expect(s.endpoints[0]!.hasPathId).toBe(true);
+    expect(s.endpoints[0]!.applicableGoals.some((g) => g.startsWith('access-control.'))).toBe(true);
+  });
+
   it('always includes a goal catalog mirroring the prompt registry', () => {
     const s = buildAttackSurface(baseEvidence());
     expect(s.goalCatalog.length).toBeGreaterThan(30);

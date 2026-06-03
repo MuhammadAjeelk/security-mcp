@@ -8,6 +8,7 @@ Internal MCP server for **authorized** security testing against **localhost or a
 ## What it does
 
 - **Crawls** an allowlisted target with `undici`, capturing headers, cookies, forms, and endpoints.
+- **API surface enumeration** — on `standard`/`deep` scans, auto-probes well-known doc/spec paths (`/api/docs`, `/swagger`, `/openapi.json`, `/v3/api-docs`, `/graphql`, …) and parses any Swagger/OpenAPI spec it finds into the endpoint inventory (sources `well-known` / `api-spec`), surfacing operations the HTML crawl never links.
 - **Multi-role differential probe** — re-hits discovered endpoints with each supplied `testAccounts` role to surface IDOR / BOLA / privilege escalation / tenant isolation.
 - **Active safe-payload library** (`includeActiveProbes: true`) — non-destructive markers for SQLi, XSS, CRLF, SSRF, path traversal, command injection. Confirms vulns without exploitation.
 - **Nuclei-style YAML template engine** (`includeTemplates: true`) — 30 bundled templates covering exposed env/git/swagger/lockfiles, Spring Actuator, Django/Flask/Laravel debug pages, phpinfo, missing security headers, dangerous CORS configs, exposed Jenkins/Grafana/Kibana/Elasticsearch/mongo-express. User-extensible via `templates/*.yaml`.

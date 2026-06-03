@@ -1,4 +1,5 @@
 import { fetchPage } from './http-scanner.js';
+import { discoverWellKnown } from './well-known.js';
 import { probeEndpointsPerRole } from './multi-role-prober.js';
 import { validateTarget } from '../policy/target-policy.js';
 import { getEnv } from '../../config/env.js';
@@ -97,6 +98,35 @@ export async function crawlTarget(opts: CrawlOptions): Promise<ScanEvidence> {
       for (const endpoint of discovered.endpoints) {
         endpoints.push(endpoint);
       }
+    }
+  }
+
+  // Map well-known API doc/spec paths (Swagger/OpenAPI/GraphQL). Users often
+  // publish a spec at /api/docs or /openapi.json and forget it is world-readable;
+  // parsing it enumerates API operations the HTML crawl never links to.
+  if (opts.request.scanType !== 'quick' && requestCount < maxRequests) {
+    try {
+      const wellKnown = await discoverWellKnown({
+        rootUrl: root.normalizedUrl,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount,
+      });
+      requestCount += wellKnown.requestCount;
+      const seen = new Set(endpoints.map((e) => `${e.method} ${e.url}`));
+      for (const e of wellKnown.endpoints) {
+        const key = `${e.method} ${e.url}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        endpoints.push(e);
+      }
+      notes.push(...wellKnown.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`Well-known discovery skipped: ${message}`);
+      opts.audit.event('well-known.error', { reason: message });
     }
   }
 

@@ -37128,6 +37128,124 @@ async function readBoundedBody(body) {
   return { body: Buffer.concat(chunks).toString("utf8"), truncated };
 }
 
+// src/core/scanner/well-known.ts
+var WELL_KNOWN_PATHS = Object.freeze([
+  // Interactive documentation UIs
+  "/api/docs",
+  "/api/doc",
+  "/docs",
+  "/swagger",
+  "/swagger-ui",
+  "/swagger-ui.html",
+  "/swagger/index.html",
+  "/redoc",
+  "/graphql",
+  "/graphiql",
+  // Machine-readable specifications
+  "/openapi.json",
+  "/openapi.yaml",
+  "/swagger.json",
+  "/swagger/v1/swagger.json",
+  "/api-docs",
+  "/api/swagger.json",
+  "/api/openapi.json",
+  "/v2/api-docs",
+  "/v3/api-docs",
+  "/docs/swagger.json",
+  "/.well-known/openapi.json"
+]);
+var SPEC_CONTENT_RE = /("openapi"|"swagger"|"paths"\s*:|openapi:|swagger:)/i;
+async function discoverWellKnown(opts) {
+  const origin = new URL(opts.rootUrl).origin;
+  const endpoints = [];
+  const notes = [];
+  let requestCount = 0;
+  for (const path of WELL_KNOWN_PATHS) {
+    if (requestCount >= opts.maxRequests) {
+      notes.push("Well-known probing stopped early: request budget exhausted.");
+      break;
+    }
+    const url = origin + path;
+    let result;
+    try {
+      result = await fetchPage({
+        url,
+        depth: 0,
+        extraAllowedHosts: opts.extraAllowedHosts,
+        account: opts.account,
+        session: opts.session,
+        audit: opts.audit
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      opts.audit.event("well-known.skip", { url, reason: message });
+      continue;
+    }
+    requestCount += 1;
+    if (result.page.status < 200 || result.page.status >= 400) continue;
+    endpoints.push({ url, method: "GET", source: "well-known" });
+    const looksLikeSpec = isJson(result.headers["content-type"]) || SPEC_CONTENT_RE.test(result.body);
+    if (!looksLikeSpec) continue;
+    const parsed = parseOpenApiEndpoints(result.body, origin);
+    if (parsed.length > 0) {
+      notes.push(`Parsed ${parsed.length} operation(s) from API spec at ${path}.`);
+      endpoints.push(...parsed);
+    }
+  }
+  return { endpoints, notes, requestCount };
+}
+function isJson(contentType) {
+  return !!contentType && /json/i.test(contentType);
+}
+var HTTP_METHODS = /* @__PURE__ */ new Set(["get", "put", "post", "delete", "patch", "head", "options"]);
+function parseOpenApiEndpoints(body, origin) {
+  let doc;
+  try {
+    doc = JSON.parse(body);
+  } catch {
+    return [];
+  }
+  if (!doc || typeof doc !== "object") return [];
+  const spec = doc;
+  const paths = spec["paths"];
+  if (!paths || typeof paths !== "object") return [];
+  const prefix = resolveBasePrefix(spec, origin);
+  const out = [];
+  for (const [rawPath, ops] of Object.entries(paths)) {
+    if (!rawPath.startsWith("/")) continue;
+    const url = prefix + rawPath;
+    const methods = ops && typeof ops === "object" ? Object.keys(ops).filter((m) => HTTP_METHODS.has(m.toLowerCase())) : [];
+    if (methods.length === 0) {
+      out.push({ url, method: "GET", source: "api-spec" });
+      continue;
+    }
+    for (const m of methods) {
+      out.push({ url, method: m.toUpperCase(), source: "api-spec" });
+    }
+  }
+  return out;
+}
+function resolveBasePrefix(spec, origin) {
+  const servers = spec["servers"];
+  if (Array.isArray(servers) && servers.length > 0) {
+    const first = servers[0];
+    if (typeof first?.url === "string" && first.url.length > 0) {
+      try {
+        const resolved = new URL(first.url, origin);
+        if (resolved.origin === origin) {
+          return origin + resolved.pathname.replace(/\/$/, "");
+        }
+      } catch {
+      }
+    }
+  }
+  const basePath = spec["basePath"];
+  if (typeof basePath === "string" && basePath.startsWith("/")) {
+    return origin + basePath.replace(/\/$/, "");
+  }
+  return origin;
+}
+
 // src/core/scanner/multi-role-prober.ts
 var MAX_PROBES_PER_ROLE = 15;
 async function probeEndpointsPerRole(input) {
@@ -37262,6 +37380,31 @@ async function crawlTarget(opts) {
       for (const endpoint of discovered.endpoints) {
         endpoints.push(endpoint);
       }
+    }
+  }
+  if (opts.request.scanType !== "quick" && requestCount < maxRequests) {
+    try {
+      const wellKnown = await discoverWellKnown({
+        rootUrl: root.normalizedUrl,
+        account,
+        session: opts.request.session,
+        extraAllowedHosts: opts.request.allowedHosts,
+        audit: opts.audit,
+        maxRequests: maxRequests - requestCount
+      });
+      requestCount += wellKnown.requestCount;
+      const seen = new Set(endpoints.map((e) => `${e.method} ${e.url}`));
+      for (const e of wellKnown.endpoints) {
+        const key = `${e.method} ${e.url}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        endpoints.push(e);
+      }
+      notes.push(...wellKnown.notes);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notes.push(`Well-known discovery skipped: ${message}`);
+      opts.audit.event("well-known.error", { reason: message });
     }
   }
   const roleProbes = opts.request.testAccounts?.length ? await probeEndpointsPerRole({
@@ -38850,7 +38993,7 @@ function urlHasQuery(url) {
 }
 function pathHasId(url) {
   const path = safePath(url);
-  return /\/(\d+|[0-9a-f]{8,}|[0-9a-f-]{16,})(\/|$)/i.test(path);
+  return /\/(\d+|[0-9a-f]{8,}|[0-9a-f-]{16,})(\/|$)/i.test(path) || /(\{[^/}]+\}|%7b[^/]*%7d)/i.test(path);
 }
 function pathLooksAdmin(url) {
   const path = safePath(url).toLowerCase();
