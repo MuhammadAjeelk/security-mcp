@@ -71,20 +71,13 @@ export function validateTarget(
     return { allowed: false, reason: 'URL has no hostname' };
   }
 
+  // Cloud-metadata / link-local hosts are never a legitimate target and cannot
+  // be overridden by any allowlist.
   if (BLOCKED_HOSTS.has(hostname)) {
     return {
       allowed: false,
       reason: `Host ${hostname} is on the blocklist (cloud metadata / link-local)`,
     };
-  }
-
-  for (const banned of FORBIDDEN_SUBSTRINGS) {
-    if (hostname.includes(banned)) {
-      return {
-        allowed: false,
-        reason: `Hostname contains forbidden substring "${banned}"`,
-      };
-    }
   }
 
   const allowed = getAllowedHosts();
@@ -99,13 +92,27 @@ export function validateTarget(
     };
   }
 
+  // An EXPLICITLY named host (env allowlist or per-call extra) is allowed even
+  // if it contains a forbidden substring — this is a deliberate operator
+  // decision (e.g. allowing `staging.live.example.com`). Checked before the
+  // forbidden-substring guard so the named exception wins. The broad `staging`
+  // substring rule below does NOT get this override.
   if (allowed.stagingHostnames.has(hostname) || extra.has(hostname)) {
     return {
       allowed: true,
-      reason: 'Allowlisted staging host',
+      reason: 'Allowlisted staging host (explicit entry overrides forbidden substrings)',
       normalizedUrl: url.toString(),
       classification: 'staging',
     };
+  }
+
+  for (const banned of FORBIDDEN_SUBSTRINGS) {
+    if (hostname.includes(banned)) {
+      return {
+        allowed: false,
+        reason: `Hostname contains forbidden substring "${banned}"`,
+      };
+    }
   }
 
   if (hostname.includes(STAGING_SUBSTRING)) {

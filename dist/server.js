@@ -36921,14 +36921,6 @@ function validateTarget(rawUrl, options = {}) {
       reason: `Host ${hostname2} is on the blocklist (cloud metadata / link-local)`
     };
   }
-  for (const banned of FORBIDDEN_SUBSTRINGS) {
-    if (hostname2.includes(banned)) {
-      return {
-        allowed: false,
-        reason: `Hostname contains forbidden substring "${banned}"`
-      };
-    }
-  }
   const allowed = getAllowedHosts();
   const extra = new Set((options.extraAllowedHosts ?? []).map((h) => h.toLowerCase()));
   if (allowed.localhostHostnames.has(hostname2) || hostname2 === "[::1]") {
@@ -36942,10 +36934,18 @@ function validateTarget(rawUrl, options = {}) {
   if (allowed.stagingHostnames.has(hostname2) || extra.has(hostname2)) {
     return {
       allowed: true,
-      reason: "Allowlisted staging host",
+      reason: "Allowlisted staging host (explicit entry overrides forbidden substrings)",
       normalizedUrl: url.toString(),
       classification: "staging"
     };
+  }
+  for (const banned of FORBIDDEN_SUBSTRINGS) {
+    if (hostname2.includes(banned)) {
+      return {
+        allowed: false,
+        reason: `Hostname contains forbidden substring "${banned}"`
+      };
+    }
   }
   if (hostname2.includes(STAGING_SUBSTRING)) {
     return {

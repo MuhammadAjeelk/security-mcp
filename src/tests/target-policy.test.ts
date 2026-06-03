@@ -35,9 +35,25 @@ describe('validateTarget', () => {
   });
 
   it('still blocks a staging host that also looks production-flavored', () => {
-    // forbidden substrings are checked before the staging allow
+    // forbidden substrings beat the broad "staging" substring allow
     expect(validateTarget('https://staging-prod.example.com/').allowed).toBe(false);
     expect(validateTarget('https://staging.live.example.com/').allowed).toBe(false);
+  });
+
+  it('lets an explicit allowlist entry override forbidden substrings', () => {
+    process.env.ALLOWED_STAGING_HOSTS = 'staging.live.example.com';
+    resetEnvCacheForTests();
+    const r = validateTarget('https://staging.live.example.com/');
+    expect(r.allowed).toBe(true);
+    expect(r.classification).toBe('staging');
+    // a per-call extra host works the same way
+    expect(
+      validateTarget('https://app.live.example.com/', {
+        extraAllowedHosts: ['app.live.example.com'],
+      }).allowed,
+    ).toBe(true);
+    // but a non-listed prod/live host is still blocked
+    expect(validateTarget('https://other.live.example.com/').allowed).toBe(false);
   });
 
   it('honours extraAllowedHosts on a per-call basis', () => {
