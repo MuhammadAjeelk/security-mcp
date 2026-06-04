@@ -38,6 +38,24 @@ The prompt registry (the ~45 modules from `list_security_prompts`, incl. SSTI, X
 
 ## Procedure
 
+> **Execution flow — create a TodoWrite list with these phases and work them in order. Do NOT stop after a single scan.**
+> 1. **Validate + scan** (Step 1) — `validate_target`, then the deep `security_scan`; read the attack surface.
+> 2. **Acquire an identity** (Steps 1.5–1.7) — TIME-BOX this to ~a quarter of the run. If you get a credential, great; if not, proceed to test the unauthenticated surface and mark auth-gated goals `blocked: needs cred` (never silently skip).
+> 3. **Iterate goals to verdicts** (Step 2) — drive the per-route + per-class coverage. Use the Ralph Loop when available; if you don't/can't invoke it, you MUST still iterate goal-by-goal across your own turns — one scan is never the whole audit.
+> 4. **MUST-PROVE gate** (below) — confirm every critical class has a definitive verdict.
+> 5. **Report** (Steps 3–4) — ALWAYS finish by calling `generate_report` and printing it INLINE. A run that ends without a rendered report is a failed run.
+
+### MUST-PROVE before you finish (these are the breach classes that get people fired — see [docs/critical-coverage.md](../docs/critical-coverage.md))
+You may not declare the audit complete until **each** of these has a definitive, evidence-backed verdict — `vulnerable`, `clean` (with the proof named in the doc), or `blocked: <one-line reason + what unblocks it>`. **Never leave one untested and never mark one `clean` without the proof.** The report MUST open with a per-class attestation line for every one:
+- **IDOR / BOLA** — object-level auth, two-account id-swap differential.
+- **Privilege escalation** — registration mass-assign + **profile-update role change** (incl. domain roles: student→teacher, member→owner) + BFLA on admin functions.
+- **Cloud storage (S3/GCS/Azure)** — bucket/object/presigned URL exposure & public access.
+- **VPC / internal** — SSRF to cloud-metadata (`169.254.169.254`)/localhost/RFC-1918, leaked internal hosts/IPs, exposed `/internal`/`/actuator`/management routes.
+- **Database** — exposed DB consoles/ports, leaked connection strings/creds, SQL/NoSQL injection.
+- **Auth vs unauth on EVERY route** — every discovered route (documented + `api-discovery`) hit unauthenticated and as low-priv; a 2xx where auth/role is required is the break.
+
+If a class is `blocked`, that is an **action item for the operator at the top of the report**, not a pass — say exactly what's needed (usually: supply `--account` tokens, or approve a temp-mail service).
+
 ### Step 1 — Establish the attack surface (once)
 1. `validate_target` → if blocked, STOP.
 2. `security_scan` with:
@@ -115,7 +133,7 @@ Point it at **any** API where a short numeric secret guards access — not just 
 Hand the probing off to the **Ralph Loop** plugin so it persists across iterations and *cannot quit early* — it re-feeds the loop body until a completion promise is genuinely true. The unit of iteration is **ONE route**: hammer that single endpoint with every applicable goal/technique to a verdict, *then* move to the next route. Do not spread thin across many routes per iteration.
 
 1. **Build a per-route matrix.** Expand the ledger into `./reports/<host>-routes.md` — one row per `attackSurface.endpoints[]` entry: `method url | applicableGoals | <verdict per goal> | notes`. Every cell starts `not-tested`. This file is the loop's memory across iterations; also create `./reports/<host>-findings.md` for confirmed findings.
-2. **Kick off the loop and then STOP touching tools this turn** — Ralph re-invokes the body below on each iteration. Invoke `/ralph-loop` with `--completion-promise "AUDIT_COVERAGE_COMPLETE"` and `--max-iterations <routeCount + 5>` (or the `maxIterations` arg, whichever is larger), passing this body (substitute `<TARGET>` / `<HOST>`):
+2. **Kick off the loop via the `SlashCommand` tool** (run `/ralph-loop` with the args below) and then STOP touching other tools this turn — Ralph re-invokes the body on each iteration. Use `--completion-promise "AUDIT_COVERAGE_COMPLETE"` and `--max-iterations <routeCount + 5>` (or the `maxIterations` arg, whichever is larger), passing this body (substitute `<TARGET>` / `<HOST>`). **If `/ralph-loop` is unavailable or the call doesn't take, do NOT skip iteration** — fall back immediately to driving the same loop yourself across your own turns (TodoWrite: one item per route/class), and still finish with the report. Either way, iteration must happen and the report must be generated.
 
    ```
    Authorized security audit of <TARGET> via the security-mcp plugin. Rules of engagement
@@ -180,7 +198,9 @@ Hand the probing off to the **Ralph Loop** plugin so it persists across iteratio
 
 > Prefer this Ralph-driven per-route loop. If the Ralph Loop plugin is unavailable, fall back to a single-session loop bounded by `maxIterations`, still iterating route-by-route to a verdict before moving on.
 
-### Step 3 — Generate the report
+### Step 3 — Generate the report (MANDATORY — every run ends here)
+Calling `generate_report` and printing it inline is not optional; a run that stops before this has failed. Before calling it, fill the **MUST-PROVE attestation**: one line per critical class (IDOR/BOLA, privilege escalation, cloud storage, VPC/internal, database, auth-vs-unauth) with its verdict (`vulnerable`/`clean`/`blocked:<reason>`) — put this at the very top of `executiveSummary`.
+
 First, decide the **takeover verdict**: did you find a path to full system control (per "THE END GOAL")? Build a **path-to-takeover narrative** — the ordered chain of steps an attacker would take, each step citing the finding that enables it, ending at the control achieved (admin / all-tenant data / RCE / identity takeover) or at the exact control that *blocked* the chain. If you could not reach takeover, state the single most load-bearing control that stopped you (so the owner knows what NOT to weaken).
 
 Call `generate_report` with:
@@ -191,7 +211,7 @@ Call `generate_report` with:
   "findings": [ ...all findings, each with title, severity, confidence, category, description, evidence, impact, remediation, attackChain... ],
   "evidence": <the evidence object from step 1 — it carries attackSurface>,
   "coverageMatrix": [ ...one row per goal you tracked: { goalId, goalTitle, status, endpointsTested, endpointsTotal, endpoints?, note? }... ],
-  "executiveSummary": "<lead with the TAKEOVER VERDICT: could an attacker fully compromise the system, yes/no, and via what chain? Then biggest risks and what to fix first. 4-8 sentences.>"
+  "executiveSummary": "<OPEN with the MUST-PROVE attestation (one line per critical class + verdict), THEN the TAKEOVER VERDICT: could an attacker fully compromise the system, yes/no, via what chain? Then biggest risks and what to fix first. Call out any `blocked` class as an operator action item.>"
 }
 ```
 Put the full kill-chain in the most relevant finding's `attackChain` field (and reference it in `executiveSummary`). This writes the Markdown + JSON to `./reports/` AND returns the rendered `markdown`.
