@@ -15,6 +15,14 @@ Commands
       (attack-surface map + goal-coverage matrix + attack-chain findings +
       prioritized remediation). Non-destructive; localhost/staging only.
 
+  /security-mcp:audit-team <url> [maxIterations] [--account role=..,token=..]
+      DEEP multi-agent audit: a manager does shared setup once (discover +
+      acquire identity), then fans out specialist sub-agents (one per breach
+      class: access-control, auth, injection, SSRF/internal, data/cloud-storage,
+      database, config/business-logic) in PARALLEL and synthesizes one report.
+      More thorough + reliable than /audit, but costs more tokens. Use for
+      serious, no-stone-unturned audits. Non-destructive; localhost/staging only.
+
   /security-mcp:scan <url> [quick|standard|deep]
       Full scan: validate → crawl → multi-role probe → prompt loop → write report
 
