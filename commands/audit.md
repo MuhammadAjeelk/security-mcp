@@ -129,14 +129,20 @@ Hand the probing off to the **Ralph Loop** plugin so it persists across iteratio
       the crawl, and admin-tagged operations in the OpenAPI spec (incl. its UI page if any).
    2. Become a normal user: self-register (Step 1.5) + beat any verification gate (Step 1.6 / 1.7).
    3. *** Post-auth role escalation via PROFILE UPDATE — the highest-yield path. *** Apps often
-      validate `role` at REGISTRATION but forget to whitelist it on profile/account update. As your
-      normal user, send the privilege fields to EVERY self-mutating endpoint — PATCH/PUT /me,
-      /profile, /account, /users/{ownId}, /settings, /account/preferences — in JSON, form, and
-      nested ({"user":{"role":"admin"}}) shapes:
-         role=admin  roles=["admin"]  isAdmin=true  is_admin=true  admin=true  isStaff=true
-         isSuperuser=true  permissions=["*"]  groups=["administrators"]  accountType=admin
-         tier=admin  type=admin  organizationRole=owner
-      Then RE-READ your own profile + decode your JWT/session claims to see if it persisted.
+      validate `role` at REGISTRATION but forget to whitelist it on profile/account update, so a
+      normal user can PATCH their own role. The engine now does this automatically when it has an
+      authenticated identity (the `profile-escalation` prober — reads your profile, PATCHes role
+      fields, re-reads to confirm persistence; its findings appear under `category: access-control`).
+      Reason about + extend it: escalation is NOT only to "admin" — it's to ANY higher role in THIS
+      app's hierarchy (EdTech student→teacher, marketplace member→owner, CMS viewer→editor). The bug
+      is that you can set your own role to *anything*. Send privilege fields to EVERY self-mutating
+      endpoint (PATCH/PUT /me, /profile, /account, /users/{ownId}, /settings) in JSON, form, and
+      nested ({"user":{"role":"..."}}) shapes, trying both generic and domain roles:
+         role=admin|owner|teacher|instructor|manager|editor|moderator   roles=["<higher>"]
+         isAdmin=true  is_admin=true  isStaff=true  isSuperuser=true  permissions=["*"]
+         groups=["administrators"]  accountType=<higher>  tier=<higher>  organizationRole=owner
+      Learn your CURRENT role first (read /me), then try to move UP from it. RE-READ your profile +
+      decode your JWT/session claims to confirm the change persisted — a bare 2xx is not proof.
    4. Confirm takeover: with the (maybe-)elevated identity, call the admin-panel routes from #1.
       A 200 + admin data/function that a normal user must not reach = ADMIN TAKEOVER (critical).
    5. Also try the unauth/low-priv admin-access paths from playbook Section B (BFLA: method swap,

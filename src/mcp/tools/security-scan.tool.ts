@@ -8,6 +8,7 @@ import { autoRegister } from '../../core/scanner/auto-register.js';
 import { bruteForceNumericCode } from '../../core/scanner/brute-forcer.js';
 import { findApiPayload } from '../../core/scanner/api-payload-finder.js';
 import { probeAccessControl } from '../../core/scanner/access-control-prober.js';
+import { probeProfileEscalation } from '../../core/scanner/profile-escalation-prober.js';
 import { runTemplates } from '../../core/templates/template-runner.js';
 import { loadBundledTemplates } from '../../core/templates/template-loader.js';
 import { AuditLogger } from '../../core/logging/audit-logger.js';
@@ -309,6 +310,25 @@ export async function handleSecurityScan(input: SecurityScanInput) {
       } catch (err) {
         audit.event('brute.error', { url: target.url, reason: err instanceof Error ? err.message : String(err) });
       }
+    }
+  }
+
+  // Post-auth role escalation via PROFILE UPDATE (mass assignment). Needs an
+  // authenticated identity — a supplied testAccount/session OR one the
+  // self-registration routine just captured. Own-account only, state-changing.
+  if (input.registerAccounts || input.includeActiveProbes) {
+    const regSession = evidence.autoRegister?.accounts?.[0]?.session;
+    const escAccount = input.testAccounts?.[0];
+    const escSession = input.session ?? regSession;
+    if (escAccount?.token || escAccount?.cookies || escSession?.bearerToken || escSession?.cookies) {
+      const escFindings = await probeProfileEscalation({
+        endpoints: evidence.attackSurface?.endpoints ?? [],
+        account: escAccount,
+        session: escSession,
+        extraAllowedHosts: input.allowedHosts,
+        audit,
+      });
+      extraFindings.push(...escFindings);
     }
   }
 

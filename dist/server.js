@@ -41419,6 +41419,239 @@ function shortHash2(s) {
   return (h >>> 0).toString(36);
 }
 
+// src/core/scanner/profile-escalation-prober.ts
+var UPDATE_PATH_RE = /\/(me|profile|account|users?|settings|account\/preferences)(\/|$)/i;
+var ESCALATION_FLAGS = {
+  isAdmin: true,
+  is_admin: true,
+  admin: true,
+  isStaff: true,
+  isSuperuser: true,
+  is_superuser: true,
+  permissions: ["*"],
+  groups: ["administrators"]
+};
+var ROLE_CANDIDATES = Object.freeze([
+  "admin",
+  "administrator",
+  "superadmin",
+  "superuser",
+  "owner",
+  "teacher",
+  "instructor",
+  "manager",
+  "editor",
+  "moderator",
+  "supervisor",
+  "staff",
+  "organizer",
+  "lead"
+]);
+function buildPayloads(maxAttempts) {
+  return ROLE_CANDIDATES.slice(0, maxAttempts).map((roleValue) => ({
+    roleValue,
+    payload: {
+      ...ESCALATION_FLAGS,
+      role: roleValue,
+      roles: [roleValue],
+      accountType: roleValue,
+      type: roleValue,
+      tier: roleValue,
+      organizationRole: roleValue === "owner" ? "owner" : roleValue
+    }
+  }));
+}
+var ROLE_KEYS = [
+  "role",
+  "roles",
+  "isadmin",
+  "is_admin",
+  "admin",
+  "isstaff",
+  "issuperuser",
+  "is_superuser",
+  "permissions",
+  "groups",
+  "accounttype",
+  "tier",
+  "type",
+  "organizationrole"
+];
+async function probeProfileEscalation(opts) {
+  const authed = !!(opts.account?.token || opts.account?.cookies || opts.session?.bearerToken || opts.session?.cookies);
+  if (!authed) return [];
+  const transport = opts.transport ?? sendRequest;
+  const max = opts.maxEndpoints ?? 6;
+  const findings = [];
+  const updateTargets = opts.endpoints.filter((e) => /^(PUT|PATCH|POST)$/i.test(e.method) && UPDATE_PATH_RE.test(safePath3(e.url))).slice(0, max);
+  if (updateTargets.length === 0) return findings;
+  const attemptsPerEndpoint = Math.max(1, Math.min(opts.maxAttempts ?? 4, ROLE_CANDIDATES.length));
+  opts.audit.event("profile-escalation.start", { targets: updateTargets.length, attemptsPerEndpoint });
+  const readUrl = pickSelfReadUrl(opts.endpoints);
+  const baseline = readUrl ? await readSignals(transport, readUrl, opts) : null;
+  for (const ep of updateTargets) {
+    const url = concrete(ep.url);
+    const method = ep.method.toUpperCase();
+    let reported = false;
+    let softReported = false;
+    for (const { payload, roleValue } of buildPayloads(attemptsPerEndpoint)) {
+      if (reported) break;
+      let res;
+      try {
+        res = await transport({
+          url,
+          method,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          account: opts.account,
+          session: opts.session,
+          extraAllowedHosts: opts.extraAllowedHosts
+        });
+      } catch (err) {
+        opts.audit.event("profile-escalation.error", { url, reason: err instanceof Error ? err.message : String(err) });
+        continue;
+      }
+      const after = readUrl ? await readSignals(transport, readUrl, opts) : signalsFromBody(res.body);
+      const verdict = detectElevation(baseline, after, res.body, payload);
+      if (verdict.vulnerable) {
+        reported = true;
+        findings.push({
+          id: `profile-escalation.${shortId(url)}`,
+          title: "Privilege escalation via profile/account update (mass assignment)",
+          severity: "critical",
+          category: "access-control",
+          description: `${method} ${url} let a normal user set their own privileged field on a self-update and the change PERSISTED on read-back (${verdict.detail}). The user controls their own role \u2014 escalation need not be to "admin"; any higher role in the app's hierarchy (e.g. student\u2192teacher, member\u2192owner) is a full break.`,
+          evidence: { url, method, injectedRole: roleValue, persisted: verdict.detail, status: res.status },
+          impact: "Any logged-in user can elevate their own role \u2192 privilege escalation and likely admin-panel takeover.",
+          remediation: "Allowlist updatable fields server-side (DTO whitelist / strong params); never bind the request body to privileged attributes (role, roles, is_admin, permissions, accountType). Role changes must go through a separate, authorized admin path. Add a regression test that sends role=<higher> as a normal user on profile update and asserts it is ignored.",
+          confidence: "high",
+          promptId: "access-control.role-escalation",
+          attackChain: `Register/login as a normal user \u2192 ${method} ${url} with role=${roleValue} \u2192 server mass-assigns it \u2192 re-read profile shows the elevated role \u2192 reach role-gated/admin routes.`
+        });
+      } else if (verdict.softHit && !softReported) {
+        softReported = true;
+        findings.push({
+          id: `profile-escalation.soft.${shortId(url)}`,
+          title: "Profile update accepted a privileged role field (2xx) \u2014 verify persistence",
+          severity: "medium",
+          category: "access-control",
+          description: `${method} ${url} returned ${res.status} and echoed an injected role value (role=${roleValue}), but persistence on an independent read-back could not be confirmed. Manually verify whether the role actually changed.`,
+          evidence: { url, method, status: res.status, injectedRole: roleValue },
+          impact: "Potential privilege escalation if the role field is bound to the user model.",
+          remediation: "Allowlist updatable fields; confirm the server ignores client-supplied role on self-update.",
+          confidence: "low",
+          promptId: "access-control.role-escalation"
+        });
+      }
+    }
+    opts.audit.event("profile-escalation.done", { url, vulnerable: reported });
+  }
+  return findings;
+}
+function detectElevation(before, after, responseBody, payload) {
+  const injected = injectedValues(payload);
+  if (after) {
+    for (const key of ROLE_KEYS) {
+      const a = after.values[key];
+      if (a === void 0) continue;
+      const b = before?.values[key];
+      if (a === b) continue;
+      if (matchesInjected(a, injected) || isPrivilegeFlag(key, a)) {
+        return { vulnerable: true, softHit: false, detail: `${key}: ${b ?? "\u2205"} \u2192 ${a}` };
+      }
+    }
+  }
+  const echoed = signalsFromBody(responseBody);
+  for (const key of ROLE_KEYS) {
+    const v = echoed.values[key];
+    if (v && (matchesInjected(v, injected) || isPrivilegeFlag(key, v))) {
+      return { vulnerable: false, softHit: true, detail: `${key} echoed ${v}` };
+    }
+  }
+  return { vulnerable: false, softHit: false, detail: "" };
+}
+function injectedValues(payload) {
+  const out = /* @__PURE__ */ new Set();
+  for (const v of Object.values(payload)) {
+    if (Array.isArray(v)) v.forEach((x) => out.add(String(x).toLowerCase()));
+    else out.add(String(v).toLowerCase());
+  }
+  return out;
+}
+function matchesInjected(value, injected) {
+  const s = value.toLowerCase();
+  if (injected.has(s)) return true;
+  return [...injected].some((inj) => inj.length > 2 && s.includes(inj));
+}
+function isPrivilegeFlag(key, value) {
+  const flagKeys = ["isadmin", "is_admin", "admin", "isstaff", "issuperuser", "is_superuser"];
+  return flagKeys.includes(key) && /true|1/i.test(value);
+}
+async function readSignals(transport, url, opts) {
+  try {
+    const r = await transport({
+      url,
+      method: "GET",
+      account: opts.account,
+      session: opts.session,
+      extraAllowedHosts: opts.extraAllowedHosts
+    });
+    if (r.status < 200 || r.status >= 300) return null;
+    return signalsFromBody(r.body);
+  } catch {
+    return null;
+  }
+}
+function signalsFromBody(body) {
+  const values = {};
+  let doc;
+  try {
+    doc = JSON.parse(body);
+  } catch {
+    return { values };
+  }
+  const visit = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    for (const [k, v] of Object.entries(obj)) {
+      const key = k.toLowerCase();
+      if (ROLE_KEYS.includes(key)) {
+        values[key] = Array.isArray(v) ? JSON.stringify(v) : String(v);
+      }
+      if (v && typeof v === "object") visit(v);
+    }
+  };
+  visit(doc);
+  return { values };
+}
+function pickSelfReadUrl(endpoints) {
+  const got = endpoints.find(
+    (e) => e.method.toUpperCase() === "GET" && /\/(me|account|profile|users\/me)(\/|$)/i.test(safePath3(e.url))
+  );
+  if (got) return concrete(got.url);
+  const any = endpoints[0];
+  if (!any) return null;
+  try {
+    return new URL("/me", new URL(any.url).origin).toString();
+  } catch {
+    return null;
+  }
+}
+function concrete(url) {
+  return url.replace(/%7B[^%]*%7D/gi, "me").replace(/\{[^}]+\}/g, "me");
+}
+function safePath3(url) {
+  try {
+    return new URL(url, "http://placeholder.local").pathname;
+  } catch {
+    return url;
+  }
+}
+function shortId(url) {
+  let h = 0;
+  for (let i = 0; i < url.length; i++) h = Math.imul(31, h) + url.charCodeAt(i) | 0;
+  return (h >>> 0).toString(36);
+}
+
 // src/core/templates/template-runner.ts
 var import_undici4 = __toESM(require_undici(), 1);
 
@@ -44748,7 +44981,7 @@ async function handleSecurityScan(input) {
         });
         if (r.found || !r.rateLimited && !r.aborted) {
           extraFindings.push({
-            id: `brute.${target.codeParam}.${shortId(target.url)}`,
+            id: `brute.${target.codeParam}.${shortId2(target.url)}`,
             title: r.found ? `Brute-forceable secret cracked: ${target.codeParam} on ${target.url}` : `No rate limiting on ${target.url} (${target.codeParam} brute-forceable)`,
             severity: r.found ? "critical" : "high",
             category: "auth",
@@ -44764,6 +44997,21 @@ async function handleSecurityScan(input) {
       } catch (err) {
         audit.event("brute.error", { url: target.url, reason: err instanceof Error ? err.message : String(err) });
       }
+    }
+  }
+  if (input.registerAccounts || input.includeActiveProbes) {
+    const regSession = evidence.autoRegister?.accounts?.[0]?.session;
+    const escAccount = input.testAccounts?.[0];
+    const escSession = input.session ?? regSession;
+    if (escAccount?.token || escAccount?.cookies || escSession?.bearerToken || escSession?.cookies) {
+      const escFindings = await probeProfileEscalation({
+        endpoints: evidence.attackSurface?.endpoints ?? [],
+        account: escAccount,
+        session: escSession,
+        extraAllowedHosts: input.allowedHosts,
+        audit
+      });
+      extraFindings.push(...escFindings);
     }
   }
   if (input.includeActiveProbes) {
@@ -44829,7 +45077,7 @@ async function handleSecurityScan(input) {
     nextStep: "For deeper reasoning, call list_security_prompts to fetch the prompt library, apply each against the returned evidence, and submit any additional findings via generate_report."
   };
 }
-function shortId(url) {
+function shortId2(url) {
   let h = 0;
   for (let i = 0; i < url.length; i++) h = Math.imul(31, h) + url.charCodeAt(i) | 0;
   return (h >>> 0).toString(36);
